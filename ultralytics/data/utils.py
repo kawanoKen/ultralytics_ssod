@@ -483,6 +483,131 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     return data  # dictionary
 
 
+def check_det_dataset_ssod(dataset: str, autodownload: bool = True) -> dict[str, Any]:
+    """
+    SSOD (Semi-Supervised Object Detection) dataset checker.
+    
+    This function is similar to check_det_dataset but specifically handles SSOD datasets
+    with special handling for ssod_train path resolution.
+    
+    Args:
+        dataset (str): Path to the dataset or dataset descriptor (like a YAML file).
+        autodownload (bool, optional): Whether to automatically download the dataset if not found.
+    
+    Returns:
+        (dict[str, Any]): Parsed dataset information and paths with ssod_train properly resolved.
+    """
+    file = check_file(dataset)
+
+    # Download (optional)
+    extract_dir = ""
+    if zipfile.is_zipfile(file) or is_tarfile(file):
+        new_dir = safe_download(file, dir=DATASETS_DIR, unzip=True, delete=False)
+        file = find_dataset_yaml(DATASETS_DIR / new_dir)
+        extract_dir, autodownload = file.parent, False
+
+    # Read YAML
+    data = YAML.load(file, append_filename=True)  # dictionary
+
+    # Checks
+    for k in "train", "val":
+        if k not in data:
+            if k != "val" or "validation" not in data:
+                raise SyntaxError(
+                    emojis(f"{dataset} '{k}:' key missing ❌.\n'train' and 'val' are required in all data YAMLs.")
+                )
+            LOGGER.warning("renaming data YAML 'validation' key to 'val' to match YOLO format.")
+            data["val"] = data.pop("validation")  # replace 'validation' key with 'val' key
+    
+    # SSOD requires ssod_train
+    if "ssod_train" not in data:
+        LOGGER.warning(f"ssod_train not found in dataset config. SSOD training may not work properly.")
+    
+    if "names" not in data and "nc" not in data:
+        raise SyntaxError(emojis(f"{dataset} key missing ❌.\n either 'names' or 'nc' are required in all data YAMLs."))
+    if "names" in data and "nc" in data and len(data["names"]) != data["nc"]:
+        raise SyntaxError(emojis(f"{dataset} 'names' length {len(data['names'])} and 'nc: {data['nc']}' must match."))
+    if "names" not in data:
+        data["names"] = [f"class_{i}" for i in range(data["nc"])]
+    else:
+        data["nc"] = len(data["names"])
+
+    data["names"] = check_class_names(data["names"])
+    data["channels"] = data.get("channels", 3)  # get image channels, default to 3
+
+    # Resolve paths
+    path = Path(extract_dir or data.get("path") or Path(data.get("yaml_file", "")).parent)  # dataset root
+    if not path.exists() and not path.is_absolute():
+        path = (DATASETS_DIR / path).resolve()  # path relative to DATASETS_DIR
+
+    # Set paths
+    data["path"] = path  # download scripts
+    
+    # Store original values before processing
+    original_train = data.get("train")
+    original_ssod_train = data.get("ssod_train")
+    
+    # Process standard paths first
+    for k in "train", "val", "test", "minival":
+        if data.get(k):  # prepend path
+            if isinstance(data[k], str):
+                x = (path / data[k]).resolve()
+                if not x.exists() and data[k].startswith("../"):
+                    x = (path / data[k][3:]).resolve()
+                data[k] = str(x)
+            else:
+                data[k] = [str((path / x).resolve()) for x in data[k]]
+    
+    # Handle ssod_train with special logic
+    if original_ssod_train:
+        if isinstance(original_ssod_train, str):
+            ssod_train_path = Path(original_ssod_train)
+            # If ssod_train is already absolute, use it as is
+            if ssod_train_path.is_absolute():
+                data["ssod_train"] = str(ssod_train_path.resolve())
+            # If train is absolute, resolve ssod_train from train's parent directory
+            elif original_train and Path(original_train).is_absolute():
+                train_path = Path(original_train)
+                data["ssod_train"] = str((train_path.parent / original_ssod_train).resolve())
+            # Otherwise, resolve from path
+            else:
+                x = (path / original_ssod_train).resolve()
+                if not x.exists() and original_ssod_train.startswith("../"):
+                    x = (path / original_ssod_train[3:]).resolve()
+                data["ssod_train"] = str(x)
+        else:
+            data["ssod_train"] = [str((path / x).resolve()) for x in original_ssod_train]
+
+    # Parse YAML
+    val, s = (data.get(x) for x in ("val", "download"))
+    if val:
+        val = [Path(x).resolve() for x in (val if isinstance(val, list) else [val])]  # val path
+        if not all(x.exists() for x in val):
+            name = clean_url(dataset)  # dataset name with URL auth stripped
+            LOGGER.info("")
+            m = f"Dataset '{name}' images not found, missing path '{next(x for x in val if not x.exists())}'"
+            if s and autodownload:
+                LOGGER.warning(m)
+            else:
+                m += f"\nNote dataset download directory is '{DATASETS_DIR}'. You can update this in '{SETTINGS_FILE}'"
+                raise FileNotFoundError(m)
+            t = time.time()
+            r = None  # success
+            if s.startswith("http") and s.endswith(".zip"):  # URL
+                safe_download(url=s, dir=DATASETS_DIR, delete=True)
+            elif s.startswith("bash "):  # bash script
+                LOGGER.info(f"Running {s} ...")
+                subprocess.run(s.split(), check=True)
+            else:  # python script
+                exec(s, {"yaml": data})
+            dt = f"({round(time.time() - t, 1)}s)"
+            s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in {0, None} else f"failure {dt} ❌"
+            LOGGER.info(f"Dataset download {s}\n")
+    check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf")  # download fonts
+
+    return data  # dictionary
+
+
 def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
     """
     Check a classification dataset such as Imagenet.
