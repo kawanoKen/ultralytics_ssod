@@ -34,16 +34,18 @@ from ultralytics.utils import (
     colorstr,
     emojis,
 )
+from ultralytics.utils.loss_ssod import EfficientTeacherLoss
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.plotting import plot_results
+from ultralytics.utils.nms import non_max_suppression
 
 import random
 from typing import Any
 
-from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data import build_dataloader, build_yolo_dataset, build_yolo_dataset_ssod
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
@@ -109,8 +111,13 @@ class SSODTrainer(BaseTrainer):
             _callbacks (list, optional): List of callback functions to be executed during training.
         """
         super().__init__(cfg, overrides, _callbacks)
+        self.batch_size_ssod = self.args.batch_ssod
+        self.burn_in_epochs = self.args.burn_in_epochs
+        self.conf_threshold_high = self.args.conf_threshold_high
+        self.conf_threshold_low = self.args.conf_threshold_low
+        self.ssod_weight = self.args.ssod_weight
 
-    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None, ssod: bool = False):
         """
         Build YOLO Dataset for training or validation.
 
@@ -123,9 +130,12 @@ class SSODTrainer(BaseTrainer):
             (Dataset): YOLO dataset object configured for the specified mode.
         """
         gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        if ssod:
+            return build_yolo_dataset_ssod(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        else:
+            return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
 
-    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
+    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train", ssod: bool = False):
         """
         Construct and return dataloader for the specified mode.
 
@@ -140,19 +150,19 @@ class SSODTrainer(BaseTrainer):
         """
         assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
         with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-            dataset = self.build_dataset(dataset_path, mode, batch_size)
+            dataset = self.build_dataset(dataset_path, mode, batch_size, ssod)
         shuffle = mode == "train"
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
         return build_dataloader(
-            dataset,
-            batch=batch_size,
-            workers=self.args.workers if mode == "train" else self.args.workers * 2,
-            shuffle=shuffle,
-            rank=rank,
-            drop_last=self.args.compile and mode == "train",
-        )
+                dataset,
+                batch=batch_size,
+                workers=self.args.workers if mode == "train" else self.args.workers * 2,
+                shuffle=shuffle,
+                rank=rank,
+                drop_last=self.args.compile and mode == "train",
+            )
 
     def preprocess_batch(self, batch: dict) -> dict:
         """
@@ -339,11 +349,12 @@ class SSODTrainer(BaseTrainer):
 
         # Dataloaders
         batch_size = self.batch_size // max(self.world_size, 1)
+        batch_size_ssod = self.batch_size_ssod // max(self.world_size, 1)
         self.train_loader = self.get_dataloader(
-            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train", ssod=False
         )
         self.ssod_train_loader = self.get_dataloader(
-            self.data["ssod_train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+            self.data["ssod_train"], batch_size=batch_size_ssod, rank=LOCAL_RANK, mode="train", ssod=True
         )
         # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
         self.test_loader = self.get_dataloader(
@@ -363,7 +374,7 @@ class SSODTrainer(BaseTrainer):
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.burn_in_epochs + math.ceil(len(self.ssod_train_loader.dataset) / max(batch_size_ssod, self.args.nbs)) * (self.epochs - self.burn_in_epochs)
         self.optimizer = self.build_optimizer(
             model=self.model,
             name=self.args.optimizer,
@@ -422,6 +433,7 @@ class SSODTrainer(BaseTrainer):
         self._setup_train()
 
         nb = len(self.train_loader)  # number of batches
+        nb_ssod = len(self.ssod_train_loader)  # number of batches for SSOD training
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
         last_opt_step = -1
         self.epoch_time = None
@@ -438,10 +450,11 @@ class SSODTrainer(BaseTrainer):
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
-        burn_in_epoch = self.args.burn_in_epochs
 
 
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
+
+        loss_func_ssod = EfficientTeacherLoss(self.model, conf_threshold_high=self.conf_threshold_high, conf_threshold_low=self.conf_threshold_low)
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -450,7 +463,7 @@ class SSODTrainer(BaseTrainer):
                 self.scheduler.step()
 
             self._model_train()
-            if epoch < burn_in_epoch:
+            if epoch < self.burn_in_epochs:
                     
                 if RANK != -1:
                     self.train_loader.sampler.set_epoch(epoch)
@@ -577,30 +590,37 @@ class SSODTrainer(BaseTrainer):
                 if self.stop:
                     break  # must break all DDP ranks
                 epoch += 1
-                if epoch == burn_in_epoch:
-                    print("SSOD training start!!")
             
             else:
+                if epoch == self.burn_in_epochs:
+                    print("psud-labeling start!! epoch: ", epoch)
                                 
                 if RANK != -1:
-                    self.train_loader.sampler.set_epoch(epoch)
-                pbar = enumerate(self.train_loader)
+                    self.ssod_train_loader.sampler.set_epoch(epoch)
+                pbar = enumerate(self.ssod_train_loader)
                 # Update dataloader attributes (optional)
                 if epoch == (self.epochs - self.args.close_mosaic):
                     self._close_dataloader_mosaic()
-                    self.train_loader.reset()
+                    self.ssod_train_loader.reset()
 
                 if RANK in {-1, 0}:
                     LOGGER.info(self.progress_string())
-                    pbar = TQDM(enumerate(self.train_loader), total=nb)
+                    pbar = TQDM(enumerate(self.ssod_train_loader), total=nb_ssod)
+                labeled_iter = iter(self.train_loader)
                 self.tloss = None
-                for i, batch in pbar:
+                for i, unlabeled_batch in pbar:
                     self.run_callbacks("on_train_batch_start")
+                    #labeledデータ取得. なくなったら作り直す
+                    try:
+                        labeled_batch = next(labeled_iter)
+                    except StopIteration:
+                        labeled_iter = iter(self.train_loader)
+                        labeled_batch = next(labeled_iter)
                     # Warmup
-                    ni = i + nb * epoch
+                    ni = i + nb_ssod * (epoch-self.burn_in_epochs) + nb * self.burn_in_epochs
                     if ni <= nw:
                         xi = [0, nw]  # x interp
-                        self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
+                        self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size_ssod]).round()))
                         for j, x in enumerate(self.optimizer.param_groups):
                             # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                             x["lr"] = np.interp(
@@ -611,14 +631,50 @@ class SSODTrainer(BaseTrainer):
 
                     # Forward
                     with autocast(self.amp):
-                        batch = self.preprocess_batch(batch)
+                        labeled_batch = self.preprocess_batch(labeled_batch)
+                        unlabeled_batch = self.preprocess_batch(unlabeled_batch)
+
+                        # self.ema.ema.train()でモデルの出力をそのまま得られる. しかし特徴点ごとなので整形必要.
+                        # self.ema.ema.train()
+                        unlabeled_preds_teacher, _ = self.ema.ema(unlabeled_batch["img"]) # (preds, feature)の形式で出力 boxはxyXY
+                        unlabeled_labels = non_max_suppression(unlabeled_preds_teacher)
+                        batch_idx_list = []
+                        for i, labels in enumerate(unlabeled_labels):
+                            if labels.numel() == 0:
+                                continue  # その画像にラベルが無い場合はスキップ
+                            batch_idx_list.append(
+                                torch.full(
+                                    (labels.shape[0], 1),  # その画像の物体数ぶん
+                                    i,                      # その画像のバッチインデックス
+                                    device=labels.device,
+                                    dtype=torch.long,
+                                )
+                            )
+                        if batch_idx_list:
+                            unlabeled_batch_idx = torch.cat(batch_idx_list, dim=0)  # shape: [total_num_labels, 1]
+                        else:
+                            # ラベルが1つも無いケース
+                            unlabeled_batch_idx = torch.empty((0, 1), device=unlabeled_labels[0].device, dtype=torch.long)
+
+                        
+                        unlabeled_labels = torch.cat((unlabeled_labels)) 
+                        unlabeled_bboxes = xyxy_to_xywh(unlabeled_labels[:, :4]) / unlabeled_batch["img"].shape[2]
+                        unlabeled_cls = unlabeled_labels[:, -1].unsqueeze(1)
+                        unlabeled_conf = unlabeled_labels[:, -2].unsqueeze(1)
+
                         if self.args.compile:
                             # Decouple inference and loss calculations for improved compile performance
-                            preds = self.model(batch["img"])
-                            loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                            preds = self.model(labeled_batch["img"])
+                            loss, self.loss_items = unwrap_model(self.model).loss(labeled_batch, preds)
                         else:
-                            loss, self.loss_items = self.model(batch)
-                        self.loss = loss.sum()
+                            loss, self.loss_items = self.model(labeled_batch)
+
+                        #SSOD Loss 計算
+                        preds_unlabeled = self.model(unlabeled_batch["img"])
+                        loss_unlabeled, loss_items_unlabeled = loss_func_ssod(preds_unlabeled, unlabeled_bboxes, unlabeled_cls, unlabeled_conf, unlabeled_batch_idx)
+
+
+                        self.loss = loss.sum() + self.ssod_weight * loss_unlabeled.sum()
                         if RANK != -1:
                             self.loss *= self.world_size
                         self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
@@ -648,13 +704,13 @@ class SSODTrainer(BaseTrainer):
                                 f"{epoch + 1}/{self.epochs}",
                                 f"{self._get_memory():.3g}G",  # (GB) GPU memory util
                                 *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                                batch["cls"].shape[0],  # batch size, i.e. 8
-                                batch["img"].shape[-1],  # imgsz, i.e 640
+                                labeled_batch["cls"].shape[0],  # batch size, i.e. 8
+                                labeled_batch["img"].shape[-1],  # imgsz, i.e 640
                             )
                         )
                         self.run_callbacks("on_batch_end")
                         if self.args.plots and ni in self.plot_idx:
-                            self.plot_training_samples(batch, ni)
+                            self.plot_training_samples(labeled_batch, ni)
 
                     self.run_callbacks("on_train_batch_end")
 
@@ -719,3 +775,16 @@ class SSODTrainer(BaseTrainer):
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
+
+
+def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
+    """
+    boxes: (..., 4) 形式の tensor [x1, y1, x2, y2]
+    return: (..., 4) 形式の tensor [cx, cy, w, h]
+    """
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    w = x2 - x1
+    h = y2 - y1
+    cx = x1 + w / 2
+    cy = y1 + h / 2
+    return torch.stack((cx, cy, w, h), dim=-1)

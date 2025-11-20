@@ -14,6 +14,7 @@ from ultralytics.utils import (
     ASSETS,
     DEFAULT_CFG,
     DEFAULT_CFG_DICT,
+    SSOD_DEFAULT_CFG_PATH,
     DEFAULT_CFG_PATH,
     FLOAT_OR_INT,
     IS_VSCODE,
@@ -277,7 +278,7 @@ def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:
 
 
 def get_cfg(
-    cfg: str | Path | dict | SimpleNamespace = DEFAULT_CFG_DICT, overrides: dict | None = None
+    cfg: str | Path | dict | SimpleNamespace = SSOD_DEFAULT_CFG_PATH, overrides: dict | None = None
 ) -> SimpleNamespace:
     """
     Load and merge configuration data from a file or dictionary, with optional overrides.
