@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+import torch.nn.functional as F
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -34,7 +35,7 @@ from ultralytics.utils import (
     colorstr,
     emojis,
 )
-from ultralytics.utils.loss_ssod import EfficientTeacherLoss
+from ultralytics.utils.loss_ssod import EfficientTeacherLoss, DomainAdversarialNet
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
@@ -116,6 +117,9 @@ class SSODTrainer(BaseTrainer):
         self.conf_threshold_high = self.args.conf_threshold_high
         self.conf_threshold_low = self.args.conf_threshold_low
         self.ssod_weight = self.args.ssod_weight
+        self.domain_adaptation = self.args.domain_adaptation
+
+
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None, ssod: bool = False):
         """
@@ -247,12 +251,17 @@ class SSODTrainer(BaseTrainer):
         else:
             return keys
 
-    def progress_string(self):
+    def progress_string(self, include_ssod: bool = False, include_da: bool = False):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
-        return ("\n" + "%11s" * (4 + len(self.loss_names))) % (
+        names_to_show = list(self.loss_names)
+        if include_ssod:
+            names_to_show += [" ssod_bloss ", " ssod_closs ", " ssod_dloss "]
+        if include_da:
+            names_to_show += [" da/loss_s ", " da/loss_t ", " da/loss "]
+        return ("\n" + "%11s" * (4 + len(names_to_show))) % (
             "Epoch",
             "GPU_mem",
-            *self.loss_names,
+            *names_to_show,
             "Instances",
             "Size",
         )
@@ -272,11 +281,39 @@ class SSODTrainer(BaseTrainer):
             on_plot=self.on_plot,
         )
 
+    def plot_pseudo_samples(self, batch: dict[str, Any], epoch, ni: int) -> None:
+        """
+        Plot training samples with their annotations.
+
+        Args:
+            batch (dict[str, Any]): Dictionary containing batch data.
+            ni (int): Number of iterations.
+        """
+        
+        # 出力先ディレクトリ runs/*/epoch{epoch} を作成
+        out_dir = self.save_dir / f"epoch{epoch}"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        plot_images(
+            labels=batch,
+            paths=batch["im_file"],
+            fname=out_dir / f"pseudo_batch{ni}.jpg",
+            on_plot=self.on_plot,
+            threaded=False,
+        )
+
     def plot_training_labels(self):
         """Create a labeled training plot of the YOLO model."""
         boxes = np.concatenate([lb["bboxes"] for lb in self.train_loader.dataset.labels], 0)
         cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
         plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
+
+    def plot_metrics(self):
+        """Plot metrics using SSOD-safe plotting to handle ragged CSV lines."""
+        from ultralytics.utils.plotting_ssod import plot_results as plot_results_ssod
+        plot_results_ssod(file=self.csv, on_plot=self.on_plot)
 
     def auto_batch(self):
         """
@@ -299,6 +336,10 @@ class SSODTrainer(BaseTrainer):
 
         # Compile model
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
+        # compile 有効時は multi_scale を無効化してグラフ膨張とメモリ増大を回避
+        if self.args.compile and getattr(self.args, "multi_scale", False):
+            LOGGER.warning("Disabling multi_scale under torch.compile to prevent graph bloat and memory growth.")
+            self.args.multi_scale = False
 
         # Freeze layers
         freeze_list = (
@@ -440,6 +481,16 @@ class SSODTrainer(BaseTrainer):
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
         self.run_callbacks("on_train_start")
+
+        # self.nc = self.data["nc"]
+        # self.n_labeled_per_cls = torch.zeros(self.nc, device= self.device, dtype= torch.long)
+        # for l in self.train_loader.dataset.labels:  # 各画像の label dict
+        #     cls_ids = l["cls"]
+        #     # クラスごとに出現数をカウント
+        #     self.n_labeled_per_cls.index_add_(0, cls_ids, torch.ones_like(cls_ids, dtype=torch.long))
+        # self.N_labeled_images = len(self.train_loader.dataset)
+        # self.N_unlabeled_images = len(self.ssod_train_loader.dataset)
+
         LOGGER.info(
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
             f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
@@ -454,7 +505,36 @@ class SSODTrainer(BaseTrainer):
 
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
 
-        loss_func_ssod = EfficientTeacherLoss(self.model, conf_threshold_high=self.conf_threshold_high, conf_threshold_low=self.conf_threshold_low)
+        self.loss_func_ssod = EfficientTeacherLoss(self.model, conf_threshold_high=self.conf_threshold_high, conf_threshold_low=self.conf_threshold_low)
+        if self.domain_adaptation:
+            # === forward hook で neck 出力を取る ===
+            self.neck_feats_labeled = []
+            self.neck_feats_unlabeled = []
+            self.da_loss_weights = self.args.da_loss_weights
+
+            def make_neck_hook(store_list):
+                def hook(module, inp, out):
+                    store_list.append(out)  # out: Tensor or list of Tensors
+                return hook
+
+            # Detect layer は model.model[-1]
+            detect_module = self.model.model[-1]
+            neck_ids = detect_module.f  # 例: [17, 20, 23] = neck(P3,P4,P5) 出力の index
+
+            # ラベル付き用 hook
+            self.neck_hooks_l = []
+            for idx in neck_ids:
+                h = self.model.model[idx].register_forward_hook(make_neck_hook(self.neck_feats_labeled))
+                self.neck_hooks_l.append(h)
+
+            # ラベルなし用 hook
+            self.neck_hooks_u = []
+            for idx in neck_ids:
+                h = self.model.model[idx].register_forward_hook(make_neck_hook(self.neck_feats_unlabeled))
+                self.neck_hooks_u.append(h)
+
+            self.domain_nets = None 
+
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -474,9 +554,12 @@ class SSODTrainer(BaseTrainer):
                     self.train_loader.reset()
 
                 if RANK in {-1, 0}:
-                    LOGGER.info(self.progress_string())
+                    LOGGER.info(self.progress_string(include_ssod=True, include_da=getattr(self, "domain_adaptation", False)))
                     pbar = TQDM(enumerate(self.train_loader), total=nb)
                 self.tloss = None
+                self.tloss_da = None
+                if self.domain_adaptation:
+                    unlabeled_iter = iter(self.ssod_train_loader)
                 for i, batch in pbar:
                     self.run_callbacks("on_train_batch_start")
                     # Warmup
@@ -485,6 +568,8 @@ class SSODTrainer(BaseTrainer):
                         xi = [0, nw]  # x interp
                         self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
                         for j, x in enumerate(self.optimizer.param_groups):
+                            if x.get("is_domain", False):
+                                continue
                             # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                             x["lr"] = np.interp(
                                 ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
@@ -495,16 +580,95 @@ class SSODTrainer(BaseTrainer):
                     # Forward
                     with autocast(self.amp):
                         batch = self.preprocess_batch(batch)
-                        if self.args.compile:
-                            # Decouple inference and loss calculations for improved compile performance
-                            preds = self.model(batch["img"])
-                            loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
-                        else:
-                            loss, self.loss_items = self.model(batch)
-                        self.loss = loss.sum()
+                        if not self.domain_adaptation:
+                            if self.args.compile:
+                                # Decouple inference and loss calculations for improved compile performance
+                                preds = self.model(batch["img"])
+                                loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                            else:
+                                loss, self.loss_items = self.model(batch)
+                        
+                                self.loss = loss.sum()
+                        # domain adaptation loss
+                        if self.domain_adaptation:
+                            try:
+                                unlabeled_batch = next(unlabeled_iter)
+                            except StopIteration:
+                                unlabeled_iter = iter(self.ssod_train_loader)
+                                unlabeled_batch = next(unlabeled_iter)
+                            unlabeled_batch = self.preprocess_batch(unlabeled_batch)
+                            if self.args.compile:
+                                # Decouple inference and loss calculations for improved compile performance
+                                self.neck_feats_unlabeled.clear()
+                                preds_unlabeled = self.model(unlabeled_batch["img"])
+                                neck_feats_unlabeled = [x for x in self.neck_feats_unlabeled]
+
+                                self.neck_feats_labeled.clear()
+                                preds = self.model(batch["img"])
+                                neck_feats_labeled = [x for x in self.neck_feats_labeled]
+
+                                loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                            else:
+                                self.neck_feats_unlabeled.clear()   
+                                preds_unlabeled = self.model(unlabeled_batch["img"])
+                                neck_feats_unlabeled = [x for x in self.neck_feats_unlabeled]
+
+                                self.neck_feats_labeled.clear()
+                                preds = self.model(batch["img"])
+                                neck_feats_labeled = [x for x in self.neck_feats_labeled]
+
+                                loss, self.loss_items = self.model.loss(batch, preds)
+                            
+                            
+
+                            if self.domain_nets is None:
+                                self.domain_nets = nn.ModuleList()
+                                for f in neck_feats_labeled:
+                                    c = f.shape[1]  # channel数
+                                    net = DomainAdversarialNet(in_dim=c, num_classes=2).to(self.device)
+                                    self.domain_nets.append(net)
+                                    # optimizer に domain_nets のパラメータを追加
+                                self.optimizer.add_param_group({
+                                            "params": self.domain_nets.parameters(),
+                                            "lr": self.args.lr0,
+                                            "initial_lr": self.args.lr0,
+                                            "weight_decay": 0.0,
+                                            "is_domain": True,
+                                        })
+                            loss_da_s_list = []
+                            loss_da_t_list = []
+
+                            for f_s, f_t, net in zip(neck_feats_labeled, neck_feats_unlabeled, self.domain_nets):
+                                feat_s = flatten_multi_scale_feats(f_s)  # [Ns, Ck]
+                                feat_t = flatten_multi_scale_feats(f_t)  # [Nt, Ck]
+
+                                logits_s = net(feat_s)
+                                logits_t = net(feat_t)
+
+                                labels_s = torch.zeros(logits_s.size(0), dtype=torch.long, device=self.device)
+                                labels_t = torch.ones (logits_t.size(0), dtype=torch.long, device=self.device)
+
+                                loss_da_s = F.cross_entropy(logits_s, labels_s)
+                                loss_da_t = F.cross_entropy(logits_t, labels_t)
+
+                                loss_da_s_list.append(loss_da_s)
+                                loss_da_t_list.append(loss_da_t)
+
+                            loss_da_s = sum(loss_da_s_list) * 0.5
+                            loss_da_t = sum(loss_da_t_list) * 0.5
+                            loss_da   = loss_da_s + loss_da_t
+
+                            self.loss = loss.sum() + loss_da * self.da_loss_weights
+
+                            # moving avg for logging (3要素: source, target, total)
+                            curr_da = np.stack([loss_da_s.detach().cpu().numpy(), loss_da_t.detach().cpu().numpy(), loss_da.detach().cpu().numpy()])
+                            self.tloss_da = curr_da if self.tloss_da is None else (self.tloss_da * i + curr_da) / (i + 1)
+                        loss_items_det = self.loss_items.detach().cpu().numpy()
+
                         if RANK != -1:
                             self.loss *= self.world_size
-                        self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                        self.tloss = loss_items_det if self.tloss is None else (self.tloss * i + loss_items_det) / (i + 1)
+                    
 
                     # Backward
                     self.scaler.scale(self.loss).backward()
@@ -524,13 +688,26 @@ class SSODTrainer(BaseTrainer):
 
                     # Log
                     if RANK in {-1, 0}:
-                        loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                        # 固定順序: train(3) -> ssod(3) -> [da(3) if enabled]
+                        nan = float("nan")
+                        loss_values = []
+                        # train
+                        train_vals = list(self.tloss if len(self.tloss.shape) > 0 else torch.unsqueeze(self.tloss, 0))
+                        loss_values += train_vals
+                        # ssod (burn-inではNaN埋め)
+                        loss_values += [nan, nan, nan]
+                        # da（有効時のみ出力）
+                        if self.domain_adaptation:
+                            da_vals = list(self.tloss_da if len(self.tloss_da.shape) > 0 else torch.unsqueeze(self.tloss_da, 0))
+                            da_vals = (da_vals + [nan, nan, nan])[:3]
+                            loss_values += da_vals
+                        num_vals = 2 + len(loss_values)  # gpu_mem + losses... + instances & size
                         pbar.set_description(
-                            ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                            ("%11s" * 2 + "%11.4g" * num_vals)
                             % (
                                 f"{epoch + 1}/{self.epochs}",
                                 f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                                *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                                *loss_values,  # losses (train, ssod, da)
                                 batch["cls"].shape[0],  # batch size, i.e. 8
                                 batch["img"].shape[-1],  # imgsz, i.e 640
                             )
@@ -559,7 +736,30 @@ class SSODTrainer(BaseTrainer):
 
                 self.nan_recovery_attempts = 0
                 if RANK in {-1, 0}:
-                    self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                    # 常に同一キーでCSVに保存（値が無い場合は NaN）
+                    nan = float("nan")
+                    # train losses (always 3 keys)
+                    train_keys = [f"train/{x}" for x in self.loss_names]
+                    if self.tloss is not None:
+                        train_vals = [round(float(x), 5) for x in (self.tloss if len(self.tloss.shape) > 0 else torch.unsqueeze(self.tloss, 0))]
+                    else:
+                        train_vals = [nan, nan, nan]
+                    log_metrics = dict(zip(train_keys, train_vals))
+                    # ssod losses placeholder (not used in burn-in)
+                    ssod_keys = [f"ssod/{x}" for x in self.loss_names]
+                    ssod_vals = [nan, nan, nan]
+                    log_metrics.update(dict(zip(ssod_keys, ssod_vals)))
+                    # da losses (3 keys)
+                    da_keys = ["da/loss_s", "da/loss_t", "da/loss"]
+
+                    if self.domain_adaptation:
+                        if getattr(self, "tloss_da", None) is not None:
+                            da_vals = [round(float(x), 5) for x in (self.tloss_da if len(self.tloss_da.shape) > 0 else torch.unsqueeze(self.tloss_da, 0))]
+                            log_metrics.update(dict(zip(da_keys, da_vals)))
+                        else:
+                            log_metrics.update(dict(zip(da_keys, [nan, nan, nan])))
+                    # save with validator metrics and lr
+                    self.save_metrics(metrics={**log_metrics, **self.metrics, **self.lr})
                     self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                     if self.args.time:
                         self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -594,6 +794,38 @@ class SSODTrainer(BaseTrainer):
             else:
                 if epoch == self.burn_in_epochs:
                     print("psud-labeling start!! epoch: ", epoch)
+
+                    # ===== ここで DA を完全に終了させる =====
+                    if self.domain_adaptation:
+                        # 1) optimizer から domain 用の param_group を外す
+                        for g in self.optimizer.param_groups:
+                            if g.get("is_domain", False):
+                                g["lr"] = 0.0
+                                for p in g["params"]:
+                                    p.requires_grad = False
+
+                        # 2) forward hook を解除（登録しているなら）
+                        for h in getattr(self, "neck_hooks_l", []):
+                            h.remove()
+                        for h in getattr(self, "neck_hooks_u", []):
+                            h.remove()
+                        self.neck_hooks_l = []
+                        self.neck_hooks_u = []
+
+                        # 4) 特徴マップ用バッファも空にする
+                        if hasattr(self, "neck_feats_labeled"):
+                            self.neck_feats_labeled.clear()
+                        if hasattr(self, "neck_feats_unlabeled"):
+                            self.neck_feats_unlabeled.clear()
+                        torch.cuda.empty_cache()
+                        LOGGER.info("Domain Adaptation disabled after burn-in.")
+                    try:
+                        self.teacher = ModelEMA(self.model)
+                        LOGGER.info("Teacher EMA at burn-in end.")
+                    except Exception as e:
+                        LOGGER.warning(f"Teacher EMA reset failed: {e}")
+                        
+
                                 
                 if RANK != -1:
                     self.ssod_train_loader.sampler.set_epoch(epoch)
@@ -604,10 +836,11 @@ class SSODTrainer(BaseTrainer):
                     self.ssod_train_loader.reset()
 
                 if RANK in {-1, 0}:
-                    LOGGER.info(self.progress_string())
+                    LOGGER.info(self.progress_string(include_ssod=True, include_da=getattr(self, "domain_adaptation", False)))
                     pbar = TQDM(enumerate(self.ssod_train_loader), total=nb_ssod)
                 labeled_iter = iter(self.train_loader)
                 self.tloss = None
+                self.tloss_unlabeled = None
                 for i, unlabeled_batch in pbar:
                     self.run_callbacks("on_train_batch_start")
                     #labeledデータ取得. なくなったら作り直す
@@ -636,8 +869,10 @@ class SSODTrainer(BaseTrainer):
 
                         # self.ema.ema.train()でモデルの出力をそのまま得られる. しかし特徴点ごとなので整形必要.
                         # self.ema.ema.train()
-                        unlabeled_preds_teacher, _ = self.ema.ema(unlabeled_batch["img"]) # (preds, feature)の形式で出力 boxはxyXY
-                        unlabeled_labels = non_max_suppression(unlabeled_preds_teacher)
+                        with torch.no_grad():
+                            unlabeled_preds_teacher, _ = self.teacher.ema(unlabeled_batch["img"]) # (preds, feature)の形式で出力 boxはxyXY
+                        unlabeled_preds_teacher = unlabeled_preds_teacher.detach()
+                        unlabeled_labels = non_max_suppression(unlabeled_preds_teacher, conf_thres=0.01, iou_thres=0.65)
                         batch_idx_list = []
                         for i, labels in enumerate(unlabeled_labels):
                             if labels.numel() == 0:
@@ -669,15 +904,24 @@ class SSODTrainer(BaseTrainer):
                         else:
                             loss, self.loss_items = self.model(labeled_batch)
 
+
                         #SSOD Loss 計算
                         preds_unlabeled = self.model(unlabeled_batch["img"])
-                        loss_unlabeled, loss_items_unlabeled = loss_func_ssod(preds_unlabeled, unlabeled_bboxes, unlabeled_cls, unlabeled_conf, unlabeled_batch_idx)
+                        loss_unlabeled, self.loss_items_unlabeled, reliable_mask, unreliable_mask = self.loss_func_ssod(preds_unlabeled, unlabeled_bboxes, unlabeled_cls, unlabeled_conf, unlabeled_batch_idx)
 
+
+
+                        loss_items_det = self.loss_items.detach().cpu().numpy()
+                        loss_items_unlabeled_det = self.loss_items_unlabeled.detach().cpu().numpy()
 
                         self.loss = loss.sum() + self.ssod_weight * loss_unlabeled.sum()
                         if RANK != -1:
                             self.loss *= self.world_size
-                        self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                        self.tloss = loss_items_det if self.tloss is None else (self.tloss * i + loss_items_det) / (i + 1)
+                        self.tloss_unlabeled = (
+                            loss_items_unlabeled_det if self.tloss_unlabeled is None
+                            else (self.tloss_unlabeled * i + loss_items_unlabeled_det) / (i + 1)
+                        )
 
                     # Backward
                     self.scaler.scale(self.loss).backward()
@@ -697,13 +941,33 @@ class SSODTrainer(BaseTrainer):
 
                     # Log
                     if RANK in {-1, 0}:
-                        loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                        # 固定順序: train(3) -> ssod(3) -> da(3)
+                        nan = float("nan")
+                        loss_values = []
+                        # train
+                        if self.tloss is not None:
+                            loss_values += list(self.tloss if len(self.tloss.shape) > 0 else torch.unsqueeze(self.tloss, 0))
+                        else:
+                            loss_values += [nan, nan, nan]
+                        # ssod
+                        if getattr(self, "tloss_unlabeled", None) is not None:
+                            loss_values += list(
+                                self.tloss_unlabeled
+                                if len(self.tloss_unlabeled.shape) > 0
+                                else torch.unsqueeze(self.tloss_unlabeled, 0)
+                            )
+                        else:
+                            loss_values += [nan, nan, nan]
+                        # da
+                        if self.domain_adaptation:
+                            loss_values += [nan, nan, nan]
+                        num_vals = 2 + len(loss_values)  # (gpu_mem, then losses..., then instances & size)
                         pbar.set_description(
-                            ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                            ("%11s" * 2 + "%11.4g" * num_vals)
                             % (
                                 f"{epoch + 1}/{self.epochs}",
                                 f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                                *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                                *loss_values,  # losses (train, ssod, da)
                                 labeled_batch["cls"].shape[0],  # batch size, i.e. 8
                                 labeled_batch["img"].shape[-1],  # imgsz, i.e 640
                             )
@@ -711,7 +975,16 @@ class SSODTrainer(BaseTrainer):
                         self.run_callbacks("on_batch_end")
                         if self.args.plots and ni in self.plot_idx:
                             self.plot_training_samples(labeled_batch, ni)
-
+                        if self.args.pseudo_label_plots:
+                            pseudo_batch = {}
+                            pseudo_batch["img"] = unlabeled_batch["img"]
+                            pseudo_batch["cls"] = unlabeled_cls[reliable_mask].squeeze(-1)
+                            pseudo_batch["bboxes"] = unlabeled_bboxes[reliable_mask]
+                            pseudo_batch["im_file"] = unlabeled_batch["im_file"]
+                            pseudo_batch["batch_idx"] = unlabeled_batch_idx[reliable_mask].squeeze(-1)
+                            pseudo_batch["resized_shape"] = unlabeled_batch["resized_shape"]
+                            pseudo_batch["ori_shape"] = unlabeled_batch["ori_shape"]
+                            self.plot_pseudo_samples(pseudo_batch, epoch, ni)
                     self.run_callbacks("on_train_batch_end")
 
                 self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
@@ -720,6 +993,7 @@ class SSODTrainer(BaseTrainer):
                 if RANK in {-1, 0}:
                     final_epoch = epoch + 1 >= self.epochs
                     self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+                    self.teacher.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
@@ -732,7 +1006,32 @@ class SSODTrainer(BaseTrainer):
 
                 self.nan_recovery_attempts = 0
                 if RANK in {-1, 0}:
-                    self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                    # 常に同一キーでCSVに保存（値が無い場合は NaN）
+                    nan = float("nan")
+                    # train losses
+                    train_keys = [f"train/{x}" for x in self.loss_names]
+                    if self.tloss is not None:
+                        train_vals = [round(float(x), 5) for x in (self.tloss if len(self.tloss.shape) > 0 else torch.unsqueeze(self.tloss, 0))]
+                    else:
+                        train_vals = [nan, nan, nan]
+                    log_metrics = dict(zip(train_keys, train_vals))
+                    # ssod losses
+                    ssod_keys = [f"ssod/{x}" for x in self.loss_names]
+                    if getattr(self, "tloss_unlabeled", None) is not None:
+                        ssod_vals = [round(float(x), 5) for x in (self.tloss_unlabeled if len(self.tloss_unlabeled.shape) > 0 else torch.unsqueeze(self.tloss_unlabeled, 0))]
+                    else:
+                        ssod_vals = [nan, nan, nan]
+                    log_metrics.update(dict(zip(ssod_keys, ssod_vals)))
+                    # da losses（有効時のみ出力）
+                    if self.domain_adaptation:
+                        da_keys = ["da/loss_s", "da/loss_t", "da/loss"]
+                        if getattr(self, "tloss_da", None) is not None:
+                            da_vals = [round(float(x), 5) for x in (self.tloss_da if len(self.tloss_da.shape) > 0 else torch.unsqueeze(self.tloss_da, 0))]
+                            da_vals = (da_vals + [nan, nan, nan])[:3]
+                        else:
+                            da_vals = [nan, nan, nan]
+                        log_metrics.update(dict(zip(da_keys, da_vals)))
+                    self.save_metrics(metrics={**log_metrics, **self.metrics, **self.lr})
                     self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                     if self.args.time:
                         self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -775,6 +1074,11 @@ class SSODTrainer(BaseTrainer):
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
+
+def flatten_multi_scale_feats(f):
+    # f: [N, C, H, W] → [N*H*W, C]
+    n, c, h, w = f.shape
+    return f.view(n, c, h * w).permute(0, 2, 1).reshape(-1, c)
 
 
 def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:

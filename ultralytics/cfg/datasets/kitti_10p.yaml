@@ -1,0 +1,18 @@
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: KITTI_yolo # dataset root dir
+train: labeled_data.txt # train images (relative to 'path') 128 images
+ssod_train: unlabeled_data.txt # train images (relative to 'path') 128 images
+val: val.txt # val images (relative to 'path') 225 images
+test: val.txt # test images (relative to 'path') 227 images
+
+# Classes
+names:
+  0: car
+  1: van
+  2: truck
+  3: pedestrian
+  4: person_sitting
+  5: cyclist
+  6: tram
+  7: misc

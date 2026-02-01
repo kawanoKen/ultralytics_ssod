@@ -1,0 +1,3 @@
+--2025-12-05 03:39:30--  https://opendatalab.com/api/open/get-file?dataset=CloudHuman
+opendatalab.com (opendatalab.com) をDNSに問いあわせています... 失敗しました: 名前またはサービスが不明です.
+wget: ホストアドレス ‘opendatalab.com’ を解決できませんでした。

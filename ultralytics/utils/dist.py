@@ -49,16 +49,32 @@ def generate_ddp_file(trainer):
     """
     module, name = f"{trainer.__class__.__module__}.{trainer.__class__.__name__}".rsplit(".", 1)
 
+    # Detect if overrides contain SSOD-specific keys to select the proper base cfg
+    _ov = dict(vars(trainer.args))
+    _ssod_keys = {
+        "ssod", "ssod_weight", "batch_ssod", "mosaic_ssod", "mixup_ssod", "cutmix_ssod",
+        "burn_in_epochs", "conf_threshold_high", "conf_threshold_low", "domain_adaptation",
+        "pseudo_label_plots", "da/loss_s", "da/loss_t", "da/loss", "da_loss_weights"
+    }
+    use_ssod_cfg = any(k in _ov for k in _ssod_keys)
+
     content = f"""
 # Ultralytics Multi-GPU training temp file (should be automatically deleted after use)
 overrides = {vars(trainer.args)}
 
 if __name__ == "__main__":
     from {module} import {name}
-    from ultralytics.utils import DEFAULT_CFG_DICT
+    from ultralytics.utils import DEFAULT_CFG_DICT, SSOD_DEFAULT_CFG_PATH
 
-    cfg = DEFAULT_CFG_DICT.copy()
-    cfg.update(save_dir='')   # handle the extra key 'save_dir'
+    # Choose base cfg depending on whether SSOD-specific keys are present
+    _ov = dict(overrides)
+    _ssod_keys = {list(_ssod_keys)}
+    _use_ssod = any(k in _ov for k in _ssod_keys)
+    if _use_ssod:
+        cfg = str(SSOD_DEFAULT_CFG_PATH)
+    else:
+        cfg = DEFAULT_CFG_DICT.copy()
+        cfg.update(save_dir='')
     trainer = {name}(cfg=cfg, overrides=overrides)
     trainer.args.model = "{getattr(trainer.hub_session, "model_url", trainer.args.model)}"
     results = trainer.train()

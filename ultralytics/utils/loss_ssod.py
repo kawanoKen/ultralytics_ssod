@@ -1,8 +1,9 @@
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.tal import make_anchors
 from ultralytics.utils.ops import xywh2xyxy
-
 import torch
+from torch import nn
+from torch.autograd import Function
 
 class EfficientTeacherLoss(v8DetectionLoss):
     def __init__(self, model, conf_threshold_high=0.6, conf_threshold_low=0.1):
@@ -72,13 +73,13 @@ class EfficientTeacherLoss(v8DetectionLoss):
             unreliable_mask_gt,
         )
 
-        ignore_mask = fg_mask_unreliable & ~fg_mask_reliable
-        target_scores_sum_reliable = max((target_scores_reliable.sum(-1)*((~ignore_mask).to(dtype))).sum(), 1)
+        ignore_mask = fg_mask_unreliable.bool() & ~fg_mask_reliable.bool()
+        target_scores_sum_reliable = max((target_scores_reliable.sum(-1)*((~ignore_mask))).sum(), 1)
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         # loss[1] = self.bce(pred_scores, target_scores_reliable.to(dtype)).sum() / target_scores_sum_reliable  # BCE
-        loss[1] = (self.bce(pred_scores, target_scores_reliable.to(dtype)).sum(-1) * ((~ignore_mask).to(dtype))).sum() / target_scores_sum_reliable  # BCE
+        loss[1] = (self.bce(pred_scores, target_scores_reliable.to(dtype)).sum(-1) * ((~ignore_mask))).sum() / target_scores_sum_reliable  # BCE
         # Bbox loss
         if fg_mask_reliable.sum():
             loss[0], loss[2] = self.bbox_loss(
@@ -95,7 +96,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach(), reliable_mask, unreliable_mask  # loss(box, cls, dfl)
     
     def _get_reliable_and_unreliable_mask(self, unlabeled_conf):
         """
@@ -110,3 +111,54 @@ class EfficientTeacherLoss(v8DetectionLoss):
         reliable_mask = (conf_flat >= self.conf_threshold_high)
         unreliable_mask = (conf_flat >= self.conf_threshold_low) & ~reliable_mask
         return reliable_mask, unreliable_mask
+
+
+
+import torch
+from torch import nn
+from torch.autograd import Function
+
+
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        lambda_ = ctx.lambda_
+        grad_input = -lambda_ * grad_output
+        return grad_input, None
+
+
+
+
+
+class GradientReversal(nn.Module):
+    def __init__(self, lambda_=1.0):
+        super().__init__()
+        self.lambda_ = float(lambda_)
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
+
+
+class DomainAdversarialNet(nn.Module):
+    """
+    x: [B, in_dim] （flatten 済み特徴）を想定したドメイン分類器
+    """
+    def __init__(self, in_dim: int, num_classes: int = 2, lambda_: float = 1.0):
+        super().__init__()
+        self.grl = GradientReversal(lambda_=lambda_)
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        # x: [B, in_dim]
+        x = self.grl(x)
+        logits = self.domain_classifier(x)
+        return logits
