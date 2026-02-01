@@ -138,9 +138,9 @@ class DFLDetectionPredictor(DetectionPredictor):
 
         B, d1, d2 = preds.shape
         # 通常: [B, no, N] なので d1 < d2 なら permute
-        if d1 < d2:
+    if d1 < d2:
             prediction = preds.permute(0, 2, 1).contiguous()  # [B, N, 4+nc]
-        else:
+    else:
             prediction = preds
 
         nc = len(self.model.names)
