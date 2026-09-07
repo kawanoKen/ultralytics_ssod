@@ -182,6 +182,8 @@ class SSODTrainer(BaseTrainer):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = batch["img"].float() / 255
+        if "img_strong" in batch:
+            batch["img_strong"] = batch["img_strong"].float() / 255
         if self.args.multi_scale:
             imgs = batch["img"]
             sz = (
@@ -195,6 +197,10 @@ class SSODTrainer(BaseTrainer):
                     math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
                 ]  # new shape (stretched to gs-multiple)
                 imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                if "img_strong" in batch:
+                    batch["img_strong"] = nn.functional.interpolate(
+                        batch["img_strong"], size=ns, mode="bilinear", align_corners=False
+                    )
             batch["img"] = imgs
         return batch
 
@@ -906,7 +912,11 @@ class SSODTrainer(BaseTrainer):
 
 
                         #SSOD Loss 計算
-                        preds_unlabeled = self.model(unlabeled_batch["img"])
+                        # Student trains on the strongly augmented view; the teacher (above) only ever
+                        # sees the weak view. Both share identical geometry/labels, so the teacher's
+                        # pseudo-boxes need no remapping to be used against the student's predictions.
+                        student_unlabeled_img = unlabeled_batch.get("img_strong", unlabeled_batch["img"])
+                        preds_unlabeled = self.model(student_unlabeled_img)
                         loss_unlabeled, self.loss_items_unlabeled, reliable_mask, unreliable_mask = self.loss_func_ssod(preds_unlabeled, unlabeled_bboxes, unlabeled_cls, unlabeled_conf, unlabeled_batch_idx)
 
 

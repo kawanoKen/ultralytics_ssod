@@ -146,3 +146,14 @@ conf_threshold_low: 0.1 # (float) confidence threshold for low confidence boxes
 ssod_weight: 0.5 # (float) weight for SSOD loss
 
 pseudo_label_plots: True # (bool) plot pseudo labels during training
+
+# Strong augmentation (student branch only, teacher always sees the weak/geometric view) ------------------------------
+strong_hsv_h: 0.05 # (float) strong HSV hue augmentation fraction
+strong_hsv_s: 0.9 # (float) strong HSV saturation augmentation fraction
+strong_hsv_v: 0.9 # (float) strong HSV value (brightness) augmentation fraction
+strong_contrast: 0.5 # (float) strong random contrast/brightness jitter magnitude (+/-)
+strong_grayscale_p: 0.2 # (float) probability of converting the strong view to grayscale
+strong_blur_p: 0.5 # (float) probability of applying gaussian blur to the strong view
+strong_cutout_p: 0.7 # (float) probability of applying cutout to the strong view
+strong_cutout_n: 5 # (int) max number of cutout patches
+strong_cutout_size: 0.1 # (float) max cutout patch size as a fraction of image height/width
