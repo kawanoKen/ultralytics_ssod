@@ -76,6 +76,7 @@ dependencies = [
     "ultralytics-thop>=2.0.0", # FLOPs computation https://github.com/ultralytics/thop
     "wandb>=0.22.2",
     "pycocotools>=2.0.10",
+    "cityscapesscripts>=2.2.4",
 ]
 
 # Optional dependencies ------------------------------------------------------------------------------------------------

@@ -6,12 +6,12 @@ from ultralytics.models.yolo.detect import SSODTrainer
 model = YOLO("yolo11n.yaml")
 #model = YOLO("yolo11n.pt")
 
-model.train(data="coco.yaml")
 
 # Train the model on the dataset
 train_results = model.train(
-    data="coco.yaml",  # Path to dataset configuration file
+    #data="coco.yaml",  # Path to dataset configuration file
     #data="african-wildlife_10p.yaml",
+    data="kitti_10p.yaml",
     epochs=350,  # Number of training epochs
     imgsz=640,  # Image size for training
     device="3",  # Device to run on (e.g., 'cpu', 0, [0,1,2,3])
