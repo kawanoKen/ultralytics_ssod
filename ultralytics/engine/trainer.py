@@ -591,6 +591,17 @@ class BaseTrainer:
                 "model": None,  # resume and final checkpoints derive from EMA
                 "ema": deepcopy(unwrap_model(self.ema.ema)).half(),
                 "updates": self.ema.updates,
+                # SSOD uses a second EMA for pseudo-label generation. Save it
+                # independently so resume and NaN recovery preserve its exact
+                # temporal state. This is None for ordinary trainers.
+                "teacher": (
+                    deepcopy(unwrap_model(self.teacher.ema)).half()
+                    if getattr(self, "teacher", None) is not None
+                    else None
+                ),
+                "teacher_updates": (
+                    self.teacher.updates if getattr(self, "teacher", None) is not None else None
+                ),
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "scaler": self.scaler.state_dict(),
                 "train_args": vars(self.args),  # save as dict
@@ -678,7 +689,10 @@ class BaseTrainer:
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update."""
         self.scaler.unscale_(self.optimizer)  # unscale gradients
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        # Retained (not just discarded) so subclasses can log the pre-clip gradient norm and
+        # whether this step was actually clipped -- clip_grad_norm_ already computes this value
+        # regardless, so storing it costs nothing extra.
+        self.last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0).item()
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
@@ -833,6 +847,9 @@ class BaseTrainer:
             self.ema = ModelEMA(self.model)  # validation with EMA creates inference tensors that can't be updated
             self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())
             self.ema.updates = ckpt["updates"]
+        if getattr(self, "teacher", None) is not None and ckpt.get("teacher") is not None:
+            self.teacher.ema.load_state_dict(ckpt["teacher"].float().state_dict())
+            self.teacher.updates = ckpt.get("teacher_updates") or 0
         self.best_fitness = ckpt.get("best_fitness", 0.0)
 
     def _handle_nan_recovery(self, epoch):

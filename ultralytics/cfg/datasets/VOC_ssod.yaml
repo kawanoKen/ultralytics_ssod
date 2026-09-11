@@ -1,0 +1,39 @@
+# PASCAL VOC dataset http://host.robots.ox.ac.uk/pascal/VOC by University of Oxford
+# Cross-domain-style SSOD split: labeled = VOC07 trainval, unlabeled = VOC12 trainval, eval = VOC07 test.
+# Requires VOC.yaml to have been used once already (downloads/converts VOC under 'path').
+# Example usage: yolo train data=VOC_ssod.yaml
+
+path: VOC
+train: # labeled: VOC07 trainval (~5011 images)
+  - images/train2007
+  - images/val2007
+ssod_train: # unlabeled: VOC12 trainval (~11540 images)
+  - images/train2012
+  - images/val2012
+val: # eval: VOC07 test (4952 images)
+  - images/test2007
+test:
+  - images/test2007
+
+# Classes
+names:
+  0: aeroplane
+  1: bicycle
+  2: bird
+  3: boat
+  4: bottle
+  5: bus
+  6: car
+  7: cat
+  8: chair
+  9: cow
+  10: diningtable
+  11: dog
+  12: horse
+  13: motorbike
+  14: person
+  15: pottedplant
+  16: sheep
+  17: sofa
+  18: train
+  19: tvmonitor

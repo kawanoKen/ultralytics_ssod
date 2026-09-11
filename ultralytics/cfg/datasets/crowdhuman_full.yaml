@@ -1,0 +1,13 @@
+# CrowdHuman dataset https://www.crowdhuman.org/ - person detection in crowded scenes.
+# Full supervised baseline: 100% of train (15000 images) as labeled, eval = official val split (4370 images).
+# Single class: person (using the full-body "fbox"). No ssod_train (not used for pure supervised training).
+# Example usage: yolo train data=crowdhuman_full.yaml
+
+path: crowdhuman
+train: images/train
+val: val.txt
+test: val.txt
+
+# Classes
+names:
+  0: person

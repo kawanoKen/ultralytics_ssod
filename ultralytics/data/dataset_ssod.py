@@ -1,4 +1,5 @@
 import random
+from copy import copy
 
 import cv2
 import numpy as np
@@ -33,6 +34,9 @@ class YOLODataset_ssod(YOLODataset):
         Returns:
             (Compose): Composed transforms.
         """
+        # Do not overwrite the trainer's shared configuration while mapping the
+        # SSOD-specific augmentation probabilities onto the standard pipeline.
+        hyp = copy(hyp)
         if self.augment:
             hyp.mosaic = hyp.mosaic_ssod if self.augment and not self.rect else 0.0
             hyp.mixup = hyp.mixup_ssod if self.augment and not self.rect else 0.0
@@ -57,6 +61,14 @@ class YOLODataset_ssod(YOLODataset):
             )
         )
         return transforms
+
+    def close_mosaic(self, hyp: dict) -> None:
+        """Disable every mix augmentation used by the unlabeled SSOD pipeline."""
+        hyp = copy(hyp)
+        hyp.mosaic_ssod = 0.0
+        hyp.mixup_ssod = 0.0
+        hyp.cutmix_ssod = 0.0
+        super().close_mosaic(hyp)
 
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:

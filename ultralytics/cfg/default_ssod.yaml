@@ -144,6 +144,39 @@ cutmix_ssod: 0.0 # (float) CutMix augmentation probability for SSOD training
 conf_threshold_high: 0.6 # (float) confidence threshold for high confidence boxes
 conf_threshold_low: 0.1 # (float) confidence threshold for low confidence boxes
 ssod_weight: 0.5 # (float) weight for SSOD loss
+diag_interval: 100 # (int) step interval for the heavier ssod_diagnostics.py logs (EMA norms, pseudo-label
+                    #        confidence distribution, BN mismatch probe); loss/assignment counts are always
+                    #        logged every step regardless of this value
+supervised_only_control: False # (bool) compute/update-matched supervised-only control run: same optimizer,
+                                #        LR schedule, warmup, batch/DDP config and iteration count as the real
+                                #        SSOD run being compared against, but unlabeled images are never
+                                #        forwarded through the model and no pseudo-label loss is computed --
+                                #        see scripts/crowdhuman/train_supervised_matched.py
+cls_loss_denom: target_score_sum # (str) choices: target_score_sum (default, divide by max(sum_target_scores_unsup,1)),
+                                  #        fixed (divide by batch_size*anchors_per_image, a content-independent
+                                  #        reference denominator), ema (divide by an EMA of sum_target_scores_unsup)
+                                  #        -- see scripts/crowdhuman/normalization_ablation.py
+ema_denom_beta: 0.9 # (float) EMA decay for cls_loss_denom=ema
+loss_balancing_mode: none # (str) choices: none (default), ema_scale (Zoph et al.-style: scale the
+                           #        unsupervised loss so its EMA magnitude tracks the supervised loss's
+                           #        EMA magnitude, on top of ssod_weight)
+loss_balance_beta: 0.9 # (float) EMA decay for loss_balancing_mode=ema_scale
+skip_zero_pseudo_cls_loss: False # (bool) if a batch has zero adopted pseudo-labels (num_unsup_positive==0),
+                                  #         skip the unsupervised classification loss for that batch instead of
+                                  #         computing it against target_scores_sum's max(...,1) floor (which
+                                  #         otherwise divides an unnormalized all-background BCE sum by 1)
+
+use_loc_conf: True # (bool) additionally require DFL localization confidence for reliable pseudo-labels
+loc_conf_threshold: 0.6 # (float) DFL box-level localization confidence threshold for reliable boxes
+
+use_edge_conf: False # (bool) per-edge DFL confidence masking: skip only the low-confidence edges of a
+                     #        reliable box's DFL loss, instead of dropping the whole box (use_loc_conf)
+edge_conf_threshold: 0.6 # (float) per-edge DFL confidence threshold below which that edge is excluded from the DFL loss
+
+# Assignment stability: off=existing behavior, r1=stability-weighted box/DFL, r2=R1 + ambiguous-negative ignore.
+# The 9 deterministic candidates are fixed to expectation and one-edge Q10/Q90 perturbations.
+assignment_stability_method: "off" # (str) choices: off, r1, r2
+assignment_perturbation: dfl # (str) choices: dfl, fixed, width_matched; fixed ratio is frozen at 0.05
 
 pseudo_label_plots: True # (bool) plot pseudo labels during training
 
@@ -157,3 +190,14 @@ strong_blur_p: 0.5 # (float) probability of applying gaussian blur to the strong
 strong_cutout_p: 0.7 # (float) probability of applying cutout to the strong view
 strong_cutout_n: 5 # (int) max number of cutout patches
 strong_cutout_size: 0.1 # (float) max cutout patch size as a fraction of image height/width
+
+# Loss-spike causal diagnosis (off by default; see dfl_ssod_algorithm_flexible.md sibling plan). ----------------------
+# When disabled, none of this changes any other behavior (design-freeze for normal/comparison runs).
+spike_diag_enabled: False # (bool) enable per-iteration diagnostic logging + spike snapshot capture
+spike_diag_log_path: # (str, optional) JSONL path for per-iteration stats; defaults to save_dir/spike_diag.jsonl
+spike_diag_threshold: 10.0 # (float) ssod/cls_loss value that triggers a one-time state snapshot
+spike_diag_snapshot_path: # (str, optional) where to save the captured pre-spike state; defaults to save_dir/spike_snapshot.pt
+spike_diag_stop_after_capture: False # (bool) stop training immediately after the first snapshot is saved
+spike_diag_intervention: normal # (str) choices: normal, skip_u, clip_u -- applied ONLY at spike_diag_intervention_iter
+spike_diag_intervention_iter: -1 # (int) global iteration index (ni) at which to apply the intervention; -1 = never
+spike_diag_g_ref: # (float, optional) pre-declared ||g_u|| cap used by the clip_u intervention

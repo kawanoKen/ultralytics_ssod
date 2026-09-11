@@ -1,0 +1,14 @@
+# CrowdHuman dataset https://www.crowdhuman.org/ - person detection in crowded scenes.
+# labeled = 10% of train (1500 images), unlabeled (ssod_train) = remaining 90% (13500 images),
+# eval = official val split (4370 images). Single class: person (using the full-body "fbox").
+# Example usage: yolo train data=crowdhuman_10p.yaml
+
+path: crowdhuman
+train: train_labeled_10p.txt # labeled train images (10%) 1500 images
+ssod_train: train_unlabeled_90p.txt # unlabeled train images (90%) 13500 images
+val: val.txt # val images 4370 images
+test: val.txt
+
+# Classes
+names:
+  0: person

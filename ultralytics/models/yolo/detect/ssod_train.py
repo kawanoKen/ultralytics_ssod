@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import gc
+import json
 import math
-import os
 import subprocess
 import time
 import warnings
@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset, check_det_dataset_ssod
-from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.utils import (
     DEFAULT_CFG,
     GIT,
@@ -36,6 +35,26 @@ from ultralytics.utils import (
     emojis,
 )
 from ultralytics.utils.loss_ssod import EfficientTeacherLoss, DomainAdversarialNet
+from ultralytics.utils.dfl_confidence import localization_confidence
+from ultralytics.utils.ssod_diagnostics import (
+    BNMismatchProbe,
+    SSODDiagnosticsLogger,
+    compute_supervised_assignment_stats,
+    dfl_entropy,
+)
+from ultralytics.utils.assignment_stability import (
+    dfl_distribution_statistics,
+    dfl_supported_box_candidates,
+    geometric_box_candidates,
+)
+from ultralytics.utils.loss_spike_lab import (
+    SpikeCaptured,
+    apply_intervention,
+    compute_split_gradients,
+    log_iteration_stats,
+    save_snapshot,
+    snapshot_trainer_state,
+)
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
@@ -68,6 +87,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+from ultralytics.utils.tal import make_anchors
 
 
 class SSODTrainer(BaseTrainer):
@@ -116,8 +136,32 @@ class SSODTrainer(BaseTrainer):
         self.burn_in_epochs = self.args.burn_in_epochs
         self.conf_threshold_high = self.args.conf_threshold_high
         self.conf_threshold_low = self.args.conf_threshold_low
+        self.use_loc_conf = self.args.use_loc_conf
+        self.loc_conf_threshold = self.args.loc_conf_threshold
+        self.use_edge_conf = self.args.use_edge_conf
+        self.edge_conf_threshold = self.args.edge_conf_threshold
+        self.spike_diag_enabled = self.args.spike_diag_enabled
+        self.spike_diag_threshold = self.args.spike_diag_threshold
+        self.spike_diag_stop_after_capture = self.args.spike_diag_stop_after_capture
+        self.spike_diag_intervention = self.args.spike_diag_intervention
+        self.spike_diag_intervention_iter = self.args.spike_diag_intervention_iter
+        self.spike_diag_g_ref = self.args.spike_diag_g_ref
+        self.spike_diag_log_path = self.args.spike_diag_log_path or str(self.save_dir / "spike_diag.jsonl")
+        self.spike_diag_snapshot_path = self.args.spike_diag_snapshot_path or str(self.save_dir / "spike_snapshot.pt")
+        self._spike_captured = False
+        self.assignment_stability_method = self.args.assignment_stability_method
+        self.assignment_perturbation = self.args.assignment_perturbation
+        if self.assignment_perturbation not in {"dfl", "fixed", "width_matched"}:
+            raise ValueError(f"assignment_perturbation must be dfl, fixed, or width_matched, got {self.assignment_perturbation!r}")
         self.ssod_weight = self.args.ssod_weight
         self.domain_adaptation = self.args.domain_adaptation
+        self.skip_zero_pseudo_cls_loss = self.args.skip_zero_pseudo_cls_loss
+        self.cls_loss_denom = self.args.cls_loss_denom
+        self.loss_balancing_mode = self.args.loss_balancing_mode
+        self.loss_balance_beta = self.args.loss_balance_beta
+        self.ema_loss_sup = None
+        self.ema_loss_unsup = None
+        self.supervised_only_control = self.args.supervised_only_control
 
 
 
@@ -159,13 +203,22 @@ class SSODTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+        # Drop the final undersized batch for the *unlabeled* SSOD loader: with drop_last=False
+        # (the normal default), each epoch's leftover remainder batch can be as small as a couple
+        # of images. In training mode BatchNorm uses per-batch statistics, and for such a tiny,
+        # possibly heavily-crowded batch those statistics can swing wildly, destabilizing logits
+        # across the whole anchor grid and producing large, spurious ssod/cls_loss spikes -- see
+        # scripts/loss_spike_lab/. The labeled loader is left untouched since it never showed this.
+        drop_last = self.args.compile and mode == "train"
+        if ssod and mode == "train":
+            drop_last = True
         return build_dataloader(
                 dataset,
                 batch=batch_size,
                 workers=self.args.workers if mode == "train" else self.args.workers * 2,
                 shuffle=shuffle,
                 rank=rank,
-                drop_last=self.args.compile and mode == "train",
+                drop_last=drop_last,
             )
 
     def preprocess_batch(self, batch: dict) -> dict:
@@ -231,6 +284,23 @@ class SSODTrainer(BaseTrainer):
         if weights:
             model.load(weights)
         return model
+
+    def save_model(self):
+        """Save training checkpoints, temporarily detaching the BN mismatch probe's forward hooks
+        first. BaseTrainer.save_model() deepcopies self.teacher.ema and torch.save()s (pickles)
+        the result; the probe's hooks are nested closures with no module-level import path, so
+        pickling them raises AttributeError. The probe is a live, training-time-only instrument
+        (see ultralytics.utils.ssod_diagnostics.BNMismatchProbe) that has no business being part
+        of a saved checkpoint anyway, so detach-save-reattach is the correct fix, not a workaround.
+        """
+        probe = getattr(self, "bn_mismatch_probe", None)
+        if probe is not None:
+            probe.remove()
+        try:
+            super().save_model()
+        finally:
+            if probe is not None:
+                self.bn_mismatch_probe = BNMismatchProbe(unwrap_model(self.teacher.ema))
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
@@ -421,7 +491,11 @@ class SSODTrainer(BaseTrainer):
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.burn_in_epochs + math.ceil(len(self.ssod_train_loader.dataset) / max(batch_size_ssod, self.args.nbs)) * (self.epochs - self.burn_in_epochs)
+        iterations = (
+            math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.burn_in_epochs
+            + math.ceil(len(self.ssod_train_loader.dataset) / max(self.batch_size_ssod, self.args.nbs))
+            * (self.epochs - self.burn_in_epochs)
+        )
         self.optimizer = self.build_optimizer(
             model=self.model,
             name=self.args.optimizer,
@@ -433,9 +507,49 @@ class SSODTrainer(BaseTrainer):
         # Scheduler
         self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
+        self._resume_teacher_state = ckpt.get("teacher") if ckpt and self.resume else None
+        self._resume_teacher_updates = ckpt.get("teacher_updates") if ckpt and self.resume else None
         self.resume_training(ckpt)
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks("on_pretrain_routine_end")
+
+    @staticmethod
+    def _warmup_iterations(warmup_epochs, burn_in_epochs, nb, nb_ssod):
+        """Convert epoch-based warmup to iterations across the supervised/SSOD phase boundary."""
+        if warmup_epochs <= 0:
+            return -1
+        supervised_epochs = min(warmup_epochs, burn_in_epochs)
+        ssod_epochs = max(warmup_epochs - burn_in_epochs, 0.0)
+        return max(round(supervised_epochs * nb + ssod_epochs * nb_ssod), 100)
+
+    def _restore_teacher_after_resume(self):
+        """Restore the pseudo-label EMA exactly when resuming after burn-in."""
+        self.teacher = ModelEMA(self.model)
+        if RANK in {-1, 0}:
+            self.bn_mismatch_probe = BNMismatchProbe(unwrap_model(self.teacher.ema))
+        if self._resume_teacher_state is not None:
+            self.teacher.ema.load_state_dict(self._resume_teacher_state.float().state_dict())
+            self.teacher.updates = self._resume_teacher_updates or 0
+            LOGGER.info("Restored SSOD teacher EMA from the resume checkpoint")
+            return
+
+        raise RuntimeError(
+            "This legacy checkpoint has no serialized SSOD teacher and cannot be resumed exactly after burn-in. "
+            "Restart from a pre-burn-in checkpoint or a checkpoint written by the fixed trainer."
+        )
+
+    def _close_dataloader_mosaic(self):
+        """Disable mix augmentations for both labeled and unlabeled training datasets."""
+        for loader_name in ("train_loader", "ssod_train_loader"):
+            loader = getattr(self, loader_name, None)
+            dataset = getattr(loader, "dataset", None)
+            if dataset is None:
+                continue
+            if hasattr(dataset, "mosaic"):
+                dataset.mosaic = False
+            if hasattr(dataset, "close_mosaic"):
+                LOGGER.info(f"Closing mosaic for {loader_name}")
+                dataset.close_mosaic(hyp=copy(self.args))
 
     def get_dataset(self):
         """
@@ -473,15 +587,232 @@ class SSODTrainer(BaseTrainer):
             data["nc"] = 1
         return data
 
+    def _do_train_supervised_only_control(self):
+        """
+        Compute/update-matched supervised-only control run.
+
+        Reuses exactly the same setup as a real SSOD run (_setup_train: same starting checkpoint,
+        same labeled dataset, same optimizer/hyperparameters, same LR schedule construction) and
+        the same per-step iteration/warmup/scheduler arithmetic as the real pseudo-label phase
+        (burn_in_epochs=0, ni = i + nb_ssod*epoch, identical warmup formula), so that a run
+        launched with the same --epochs/--batch/--batch_ssod/--device as an SSOD run performs
+        the exact same number of optimizer updates on the exact same step-indexed LR schedule.
+
+        The only difference: unlabeled images are never loaded or forwarded through the model
+        (no BN update from them, no pseudo-label loss of any kind) -- `self.ssod_train_loader` is
+        built (by the shared _setup_train()) only so `len(self.ssod_train_loader)` gives the same
+        per-epoch step count as the real run; it is never iterated. The 150 labeled images are
+        cycled repeatedly via the same try/except StopIteration pattern the real run's labeled
+        side already uses, so batch composition/reshuffling behavior matches exactly too.
+        """
+        if self.world_size > 1:
+            self._setup_ddp()
+        self._setup_train()
+
+        nb_ssod = len(self.ssod_train_loader)  # iteration-count reference only; never iterated
+        nb = len(self.train_loader)
+        nw = self._warmup_iterations(self.args.warmup_epochs, 0, nb, nb_ssod)
+        last_opt_step = -1
+        self.epoch_time = None
+        self.epoch_time_start = time.time()
+        self.train_time_start = time.time()
+        self.run_callbacks("on_train_start")
+
+        LOGGER.info(
+            f"[supervised_only_control] Image sizes {self.args.imgsz}\n"
+            f"Logging results to {colorstr('bold', self.save_dir)}\n"
+            f"Starting {self.epochs} epochs x {nb_ssod} steps (compute-matched to the SSOD run), "
+            f"labeled-only, no unlabeled forward..."
+        )
+        if self.args.close_mosaic:
+            base_idx = (self.epochs - self.args.close_mosaic) * nb_ssod
+            self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+        epoch = self.start_epoch
+        self.optimizer.zero_grad()
+        if RANK in {-1, 0}:
+            self.ssod_diag = SSODDiagnosticsLogger(
+                self.save_dir, ema_interval=self.args.diag_interval, dist_interval=self.args.diag_interval
+            )
+        unsup_stats_zero = {
+            "num_pseudo_boxes": 0,
+            "num_unsup_assigned": 0,
+            "num_unsup_positive": 0,
+            "sum_target_scores_unsup": 0.0,
+            "assigned_anchors_per_pseudo_box_mean": 0.0,
+            "assigned_anchors_per_pseudo_box_std": 0.0,
+            "target_score_mean_unsup": 0.0,
+            "target_score_std_unsup": 0.0,
+            "cls_loss_skipped": False,
+        }
+        zero_loss_items = np.zeros(3, dtype=np.float32)
+
+        while True:
+            self.epoch = epoch
+            self.run_callbacks("on_train_epoch_start")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.scheduler.step()
+            self._model_train()
+            if RANK != -1:
+                self.train_loader.sampler.set_epoch(epoch)
+            if epoch == (self.epochs - self.args.close_mosaic):
+                self._close_dataloader_mosaic()
+                self.train_loader.reset()
+            if RANK in {-1, 0}:
+                LOGGER.info(self.progress_string())
+                pbar = TQDM(range(nb_ssod), total=nb_ssod)
+            else:
+                pbar = range(nb_ssod)
+            labeled_iter = iter(self.train_loader)
+            self.tloss = None
+            for i in pbar:
+                self.run_callbacks("on_train_batch_start")
+                try:
+                    labeled_batch = next(labeled_iter)
+                except StopIteration:
+                    labeled_iter = iter(self.train_loader)
+                    labeled_batch = next(labeled_iter)
+                ni = i + nb_ssod * epoch  # matches the real run's ni with burn_in_epochs=0
+                if ni <= nw:
+                    xi = [0, nw]
+                    self.accumulate = max(
+                        1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size_ssod]).round())
+                    )
+                    for j, x in enumerate(self.optimizer.param_groups):
+                        x["lr"] = np.interp(
+                            ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
+                        )
+                        if "momentum" in x:
+                            x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
+
+                with autocast(self.amp):
+                    labeled_batch = self.preprocess_batch(labeled_batch)
+                    preds = self.model(labeled_batch["img"])
+                    loss, self.loss_items = unwrap_model(self.model).loss(labeled_batch, preds)
+                    self.loss = loss.sum()
+                    if RANK != -1:
+                        self.loss *= self.world_size
+                    loss_items_det = self.loss_items.detach().cpu().numpy()
+                    self.tloss = loss_items_det if self.tloss is None else (self.tloss * i + loss_items_det) / (i + 1)
+
+                    if RANK in {-1, 0}:
+                        sup_stats = compute_supervised_assignment_stats(
+                            unwrap_model(self.model).criterion, preds, labeled_batch
+                        )
+                        self.ssod_diag.log_training_dynamics(
+                            ni,
+                            epoch,
+                            loss_items_det,
+                            zero_loss_items,
+                            sup_stats,
+                            unsup_stats_zero,
+                            total_loss=float(self.loss.item()),
+                            teacher_conf_max=None,
+                            teacher_conf_mean=None,
+                            num_teacher_predictions_pre_filter=None,
+                            num_teacher_predictions_post_filter=None,
+                        )
+                        self.ssod_diag.log_assignment_dynamics(ni, epoch, sup_stats, unsup_stats_zero)
+
+                self.scaler.scale(self.loss).backward()
+                if ni - last_opt_step >= self.accumulate:
+                    self.optimizer_step()
+                    last_opt_step = ni
+                    if RANK in {-1, 0}:
+                        self.ssod_diag.log_grad_norm(ni, epoch, self.last_grad_norm, total_loss=float(self.loss.item()))
+                    if self.args.time:
+                        self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
+                        if RANK != -1:
+                            broadcast_list = [self.stop if RANK == 0 else None]
+                            dist.broadcast_object_list(broadcast_list, 0)
+                            self.stop = broadcast_list[0]
+                        if self.stop:
+                            break
+
+                if RANK in {-1, 0}:
+                    loss_values = list(self.tloss if len(self.tloss.shape) > 0 else torch.unsqueeze(self.tloss, 0))
+                    pbar.set_description(
+                        ("%11s" * 2 + "%11.4g" * (2 + len(loss_values)))
+                        % (
+                            f"{epoch + 1}/{self.epochs}",
+                            f"{self._get_memory():.3g}G",
+                            *loss_values,
+                            labeled_batch["cls"].shape[0],
+                            labeled_batch["img"].shape[-1],
+                        )
+                    )
+                    self.run_callbacks("on_batch_end")
+                self.run_callbacks("on_train_batch_end")
+
+            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}
+            self.run_callbacks("on_train_epoch_end")
+            final_epoch = epoch + 1 >= self.epochs  # unconditional: read outside any RANK guard below
+            if RANK in {-1, 0}:
+                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+
+            if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+                self._clear_memory(threshold=0.5)
+                self.metrics, self.fitness = self.validate()
+
+            if self._handle_nan_recovery(epoch):
+                continue
+
+            self.nan_recovery_attempts = 0
+            if RANK in {-1, 0}:
+                nan = float("nan")
+                train_keys = [f"train/{x}" for x in self.loss_names]
+                train_vals = [
+                    round(float(x), 5) for x in (self.tloss if len(self.tloss.shape) > 0 else torch.unsqueeze(self.tloss, 0))
+                ]
+                log_metrics = dict(zip(train_keys, train_vals))
+                ssod_keys = [f"ssod/{x}" for x in self.loss_names]
+                log_metrics.update(dict(zip(ssod_keys, [nan, nan, nan])))
+                self.save_metrics(metrics={**log_metrics, **self.metrics, **self.lr})
+                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
+                if self.args.time:
+                    self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
+                if self.args.save or final_epoch:
+                    self.save_model()
+                    self.run_callbacks("on_model_save")
+
+            t = time.time()
+            self.epoch_time = t - self.epoch_time_start
+            self.epoch_time_start = t
+            self.run_callbacks("on_fit_epoch_end")
+            self._clear_memory(0.5)
+
+            if RANK != -1:
+                broadcast_list = [self.stop if RANK == 0 else None]
+                dist.broadcast_object_list(broadcast_list, 0)
+                self.stop = broadcast_list[0]
+            if self.stop:
+                break
+            epoch += 1
+
+        seconds = time.time() - self.train_time_start
+        LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
+        self.final_eval()
+        if RANK in {-1, 0}:
+            if self.args.plots:
+                self.plot_metrics()
+            if getattr(self, "ssod_diag", None) is not None:
+                self.ssod_diag.close()
+            self.run_callbacks("on_train_end")
+        self._clear_memory()
+        unset_deterministic()
+        self.run_callbacks("teardown")
+
     def _do_train(self):
         """Train the model with the specified world size."""
+        if self.supervised_only_control:
+            return self._do_train_supervised_only_control()
         if self.world_size > 1:
             self._setup_ddp()
         self._setup_train()
 
         nb = len(self.train_loader)  # number of batches
         nb_ssod = len(self.ssod_train_loader)  # number of batches for SSOD training
-        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
+        nw = self._warmup_iterations(self.args.warmup_epochs, self.burn_in_epochs, nb, nb_ssod)
         last_opt_step = -1
         self.epoch_time = None
         self.epoch_time_start = time.time()
@@ -511,7 +842,27 @@ class SSODTrainer(BaseTrainer):
 
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
 
-        self.loss_func_ssod = EfficientTeacherLoss(self.model, conf_threshold_high=self.conf_threshold_high, conf_threshold_low=self.conf_threshold_low)
+        self.loss_func_ssod = EfficientTeacherLoss(
+            unwrap_model(self.model),
+            conf_threshold_high=self.conf_threshold_high,
+            conf_threshold_low=self.conf_threshold_low,
+            use_loc_conf=self.use_loc_conf,
+            loc_conf_threshold=self.loc_conf_threshold,
+            use_edge_conf=self.use_edge_conf,
+            edge_conf_threshold=self.edge_conf_threshold,
+            assignment_stability_method=self.assignment_stability_method,
+            skip_zero_pseudo_cls_loss=self.skip_zero_pseudo_cls_loss,
+            cls_loss_denom=self.cls_loss_denom,
+            ema_denom_beta=self.args.ema_denom_beta,
+        )
+        if RANK in {-1, 0}:
+            self.ssod_diag = SSODDiagnosticsLogger(self.save_dir, ema_interval=self.args.diag_interval, dist_interval=self.args.diag_interval)
+        if self.start_epoch > self.burn_in_epochs:
+            self._restore_teacher_after_resume()
+            if RANK != -1 and self.world_size > 1 and isinstance(self.model, nn.parallel.DistributedDataParallel):
+                self.model = nn.parallel.DistributedDataParallel(
+                    unwrap_model(self.model), device_ids=[RANK], find_unused_parameters=True, static_graph=True
+                )
         if self.domain_adaptation:
             # === forward hook で neck 出力を取る ===
             self.neck_feats_labeled = []
@@ -681,6 +1032,18 @@ class SSODTrainer(BaseTrainer):
                     if ni - last_opt_step >= self.accumulate:
                         self.optimizer_step()
                         last_opt_step = ni
+                        # BUG FIX: self.teacher (the pseudo-label-generating EMA) was previously
+                        # never updated after being created at burn-in end -- only its non-weight
+                        # attributes were refreshed via update_attr() once per epoch. It therefore
+                        # stayed frozen at the burn-in snapshot for the entire pseudo-label phase,
+                        # rather than actually tracking the student as a Mean-Teacher EMA is meant
+                        # to. `self.ema` (the separate, checkpoint-saved EMA) was already updated
+                        # correctly inside optimizer_step() above; self.teacher needs the same call.
+                        # (self.teacher does not exist yet during burn-in, hence the guard.)
+                        if getattr(self, "teacher", None) is not None:
+                            self.teacher.update(self.model)
+                        if RANK in {-1, 0}:
+                            self.ssod_diag.log_grad_norm(ni, epoch, self.last_grad_norm, total_loss=float(self.loss.item()))
 
                         # Timed stopping
                         if self.args.time:
@@ -727,8 +1090,13 @@ class SSODTrainer(BaseTrainer):
                 self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
                 self.run_callbacks("on_train_epoch_end")
+                # Computed unconditionally: `final_epoch` is read below outside any RANK guard
+                # (`if self.args.val or final_epoch or ...`), so leaving this inside `if RANK in
+                # {-1, 0}` left it unbound on other ranks -- masked whenever self.args.val is
+                # truthy (Python's `or` short-circuits before ever evaluating final_epoch), but a
+                # real UnboundLocalError on non-zero ranks under DDP with val=False.
+                final_epoch = epoch + 1 >= self.epochs
                 if RANK in {-1, 0}:
-                    final_epoch = epoch + 1 >= self.epochs
                     self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
@@ -828,17 +1196,31 @@ class SSODTrainer(BaseTrainer):
                     try:
                         self.teacher = ModelEMA(self.model)
                         LOGGER.info("Teacher EMA at burn-in end.")
+                        if RANK in {-1, 0}:
+                            self.bn_mismatch_probe = BNMismatchProbe(unwrap_model(self.teacher.ema))
                     except Exception as e:
                         LOGGER.warning(f"Teacher EMA reset failed: {e}")
-                        
 
-                                
+                    # From here on every step runs two forward passes (labeled, then unlabeled)
+                    # through self.model before a single combined backward(). Plain DDP's Reducer
+                    # assumes one forward per backward and corrupts autograd's in-place version
+                    # tracking across the two calls, raising "modified by an inplace operation"
+                    # RuntimeErrors. Re-wrapping with static_graph=True (the officially documented
+                    # fix for multiple-forward-per-iteration DDP use) is safe here since burn-in
+                    # already finished and no parameters are frozen/unfrozen afterward.
+                    if RANK != -1 and self.world_size > 1 and isinstance(self.model, nn.parallel.DistributedDataParallel):
+                        self.model = nn.parallel.DistributedDataParallel(
+                            unwrap_model(self.model), device_ids=[RANK], find_unused_parameters=True, static_graph=True
+                        )
+
                 if RANK != -1:
+                    self.train_loader.sampler.set_epoch(epoch)
                     self.ssod_train_loader.sampler.set_epoch(epoch)
                 pbar = enumerate(self.ssod_train_loader)
                 # Update dataloader attributes (optional)
                 if epoch == (self.epochs - self.args.close_mosaic):
                     self._close_dataloader_mosaic()
+                    self.train_loader.reset()
                     self.ssod_train_loader.reset()
 
                 if RANK in {-1, 0}:
@@ -848,6 +1230,7 @@ class SSODTrainer(BaseTrainer):
                 self.tloss = None
                 self.tloss_unlabeled = None
                 for i, unlabeled_batch in pbar:
+                    stability_step_start = time.perf_counter()
                     self.run_callbacks("on_train_batch_start")
                     #labeledデータ取得. なくなったら作り直す
                     try:
@@ -876,39 +1259,117 @@ class SSODTrainer(BaseTrainer):
                         # self.ema.ema.train()でモデルの出力をそのまま得られる. しかし特徴点ごとなので整形必要.
                         # self.ema.ema.train()
                         with torch.no_grad():
-                            unlabeled_preds_teacher, _ = self.teacher.ema(unlabeled_batch["img"]) # (preds, feature)の形式で出力 boxはxyXY
+                            unlabeled_preds_teacher, unlabeled_feats_teacher = self.teacher.ema(unlabeled_batch["img"]) # (preds, feature)の形式で出力 boxはxyXY
                         unlabeled_preds_teacher = unlabeled_preds_teacher.detach()
-                        unlabeled_labels = non_max_suppression(unlabeled_preds_teacher, conf_thres=0.01, iou_thres=0.65)
+                        if RANK in {-1, 0}:
+                            # BN mismatch probe hooks fired during the forward call just above --
+                            # read them now, before the next teacher forward overwrites them.
+                            if getattr(self, "bn_mismatch_probe", None) is not None:
+                                self.ssod_diag.maybe_log_bn_mismatch(ni, epoch, self.bn_mismatch_probe)
+                            _teacher_conf_all = unlabeled_preds_teacher[:, 4 : 4 + self.loss_func_ssod.nc, :]
+                            teacher_conf_max = float(_teacher_conf_all.max().item())
+                            teacher_conf_mean = float(_teacher_conf_all.mean().item())
+
+                        # DFL localization confidence: recover the raw per-edge distributions in the
+                        # same anchor ordering `non_max_suppression` indexes into (see
+                        # ultralytics/utils/dfl_confidence.py), so surviving pseudo-boxes can be traced
+                        # back to their DFL logits after NMS.
+                        pred_distri_teacher, _ = torch.cat(
+                            [xi.view(unlabeled_feats_teacher[0].shape[0], self.loss_func_ssod.no, -1) for xi in unlabeled_feats_teacher], 2
+                        ).split((self.loss_func_ssod.reg_max * 4, self.loss_func_ssod.nc), 1)
+                        pred_distri_teacher = pred_distri_teacher.permute(0, 2, 1).contiguous().detach()  # (B, N, 4*reg_max)
+                        teacher_anchor_points, teacher_stride_tensor = make_anchors(
+                            unlabeled_feats_teacher, self.loss_func_ssod.stride, 0.5
+                        )
+
+                        unlabeled_labels, keep_idxs = non_max_suppression(
+                            unlabeled_preds_teacher, conf_thres=0.01, iou_thres=0.65, return_idxs=True
+                        )
+                        # Diagnostics only (see ultralytics.utils.ssod_diagnostics section 3): how many
+                        # raw teacher candidates cleared NMS's own conf_thres=0.01 gate before NMS's IoU
+                        # suppression ever ran, so num_removed_by_nms below is isolated from
+                        # num_removed_by_confidence (our separate, much higher SSOD adoption threshold).
+                        num_candidates_prenms = int(
+                            (unlabeled_preds_teacher[:, 4 : 4 + self.loss_func_ssod.nc, :].amax(1) >= 0.01).sum()
+                        )
+                        n_post_nms = sum(len(labels) for labels in unlabeled_labels)
                         batch_idx_list = []
-                        for i, labels in enumerate(unlabeled_labels):
+                        loc_conf_list = []
+                        edge_conf_list = []
+                        candidate_box_list = []
+                        entropy_list = []
+                        # Do not shadow the outer dataloader batch index `i`; it is used below for
+                        # running-loss averaging, logging and checkpoint visualization cadence.
+                        for image_idx, labels in enumerate(unlabeled_labels):
                             if labels.numel() == 0:
                                 continue  # その画像にラベルが無い場合はスキップ
                             batch_idx_list.append(
                                 torch.full(
                                     (labels.shape[0], 1),  # その画像の物体数ぶん
-                                    i,                      # その画像のバッチインデックス
+                                    image_idx,              # その画像のバッチインデックス
                                     device=labels.device,
                                     dtype=torch.long,
                                 )
                             )
+                            box_distri = pred_distri_teacher[image_idx, keep_idxs[image_idx]].view(
+                                -1, 4, self.loss_func_ssod.reg_max
+                            )
+                            edge_conf, box_conf = localization_confidence(box_distri, self.loss_func_ssod.reg_max)
+                            loc_conf_list.append(box_conf.unsqueeze(-1))
+                            edge_conf_list.append(edge_conf)
+                            entropy_list.append(dfl_entropy(box_distri))
+                            selected_idx = keep_idxs[image_idx]
+                            selected_anchors = teacher_anchor_points[selected_idx]
+                            selected_strides = teacher_stride_tensor[selected_idx]
+                            if self.assignment_perturbation == "dfl":
+                                candidate_xyxy = dfl_supported_box_candidates(
+                                    box_distri, selected_anchors, selected_strides
+                                )
+                                candidate_xyxy[0] = labels[:, :4]
+                            else:
+                                dfl_stats = dfl_distribution_statistics(box_distri)
+                                candidate_xyxy = geometric_box_candidates(
+                                    labels[:, :4],
+                                    self.assignment_perturbation,
+                                    dfl_width=dfl_stats["width"],
+                                    dfl_expectation=dfl_stats["expectation"],
+                                    anchor_points=selected_anchors,
+                                    stride_tensor=selected_strides,
+                                    reg_max=self.loss_func_ssod.reg_max,
+                                    fixed_ratio=0.05,
+                                )
+                            candidate_xywh = xyxy_to_xywh(candidate_xyxy.reshape(-1, 4)).view(9, -1, 4)
+                            candidate_box_list.append(candidate_xywh.permute(1, 0, 2) / unlabeled_batch["img"].shape[2])
                         if batch_idx_list:
                             unlabeled_batch_idx = torch.cat(batch_idx_list, dim=0)  # shape: [total_num_labels, 1]
+                            unlabeled_loc_conf = torch.cat(loc_conf_list, dim=0)  # shape: [total_num_labels, 1]
+                            unlabeled_edge_conf = torch.cat(edge_conf_list, dim=0)  # shape: [total_num_labels, 4]
+                            unlabeled_candidate_bboxes = torch.cat(candidate_box_list, dim=0)  # (N, 9, 4), normalized xywh
+                            unlabeled_dfl_entropy = torch.cat(entropy_list, dim=0)  # shape: [total_num_labels]
                         else:
                             # ラベルが1つも無いケース
                             unlabeled_batch_idx = torch.empty((0, 1), device=unlabeled_labels[0].device, dtype=torch.long)
+                            unlabeled_loc_conf = torch.empty((0, 1), device=unlabeled_labels[0].device, dtype=torch.float)
+                            unlabeled_edge_conf = torch.empty((0, 4), device=unlabeled_labels[0].device, dtype=torch.float)
+                            unlabeled_candidate_bboxes = torch.empty(
+                                (0, 9, 4), device=unlabeled_labels[0].device, dtype=torch.float
+                            )
+                            unlabeled_dfl_entropy = torch.empty((0,), device=unlabeled_labels[0].device, dtype=torch.float)
 
-                        
-                        unlabeled_labels = torch.cat((unlabeled_labels)) 
+
+                        unlabeled_labels = torch.cat((unlabeled_labels))
                         unlabeled_bboxes = xyxy_to_xywh(unlabeled_labels[:, :4]) / unlabeled_batch["img"].shape[2]
                         unlabeled_cls = unlabeled_labels[:, -1].unsqueeze(1)
                         unlabeled_conf = unlabeled_labels[:, -2].unsqueeze(1)
 
-                        if self.args.compile:
-                            # Decouple inference and loss calculations for improved compile performance
-                            preds = self.model(labeled_batch["img"])
-                            loss, self.loss_items = unwrap_model(self.model).loss(labeled_batch, preds)
-                        else:
-                            loss, self.loss_items = self.model(labeled_batch)
+                        # Always decouple inference and loss (mathematically identical to
+                        # `self.model(labeled_batch)` -- see DetectionModel.forward/.loss in
+                        # ultralytics/nn/tasks.py, same single forward pass either way) so the
+                        # raw `preds` are available below for compute_supervised_assignment_stats
+                        # without an extra model forward call (which would double-update
+                        # BatchNorm's running stats and change training dynamics).
+                        preds = self.model(labeled_batch["img"])
+                        loss, self.loss_items = unwrap_model(self.model).loss(labeled_batch, preds)
 
 
                         #SSOD Loss 計算
@@ -916,15 +1377,69 @@ class SSODTrainer(BaseTrainer):
                         # sees the weak view. Both share identical geometry/labels, so the teacher's
                         # pseudo-boxes need no remapping to be used against the student's predictions.
                         student_unlabeled_img = unlabeled_batch.get("img_strong", unlabeled_batch["img"])
-                        preds_unlabeled = self.model(student_unlabeled_img)
-                        loss_unlabeled, self.loss_items_unlabeled, reliable_mask, unreliable_mask = self.loss_func_ssod(preds_unlabeled, unlabeled_bboxes, unlabeled_cls, unlabeled_conf, unlabeled_batch_idx)
+                        # Under DDP, calling self.model(...) a second time in the same iteration (the
+                        # labeled forward above already went through it) re-triggers DDP's
+                        # prepare-for-backward bookkeeping and corrupts autograd's in-place version
+                        # tracking on shared buffers ("modified by an inplace operation" RuntimeError).
+                        # Forwarding through the unwrapped module for this second call avoids that:
+                        # gradients still flow into the same shared parameters and get reduced by the
+                        # single combined backward() below, since DDP's hooks are attached to the
+                        # parameters themselves, not to which module reference issued the forward.
+                        preds_unlabeled = unwrap_model(self.model)(student_unlabeled_img)
+                        _diag_now = RANK in {-1, 0} and self.ssod_diag.should_log_dist(ni)
+                        loss_unlabeled, self.loss_items_unlabeled, reliable_mask, unreliable_mask = self.loss_func_ssod(
+                            preds_unlabeled,
+                            unlabeled_bboxes,
+                            unlabeled_cls,
+                            unlabeled_conf,
+                            unlabeled_batch_idx,
+                            unlabeled_loc_conf,
+                            unlabeled_edge_conf,
+                            unlabeled_candidate_bboxes,
+                            compute_extra_diag=_diag_now,
+                        )
+                        if self.assignment_stability_method != "off" and RANK in {-1, 0}:
+                            stability_record = {
+                                "epoch": epoch,
+                                "batch": i,
+                                "iteration": ni,
+                                "method": self.assignment_stability_method,
+                                "perturbation": self.assignment_perturbation,
+                                **self.loss_func_ssod.last_stability_stats,
+                                "iteration_seconds_to_loss": time.perf_counter() - stability_step_start,
+                                "vram_allocated_bytes": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+                                "vram_reserved_bytes": torch.cuda.memory_reserved() if torch.cuda.is_available() else 0,
+                            }
+                            stability_log = self.save_dir / "assignment_stability.jsonl"
+                            with stability_log.open("a", encoding="utf-8") as file:
+                                file.write(json.dumps(stability_record) + "\n")
 
 
 
                         loss_items_det = self.loss_items.detach().cpu().numpy()
                         loss_items_unlabeled_det = self.loss_items_unlabeled.detach().cpu().numpy()
 
-                        self.loss = loss.sum() + self.ssod_weight * loss_unlabeled.sum()
+                        if self.loss_balancing_mode == "ema_scale":
+                            # Zoph et al.-style loss-scale matching: instead of a fixed
+                            # ssod_weight, scale the unsupervised loss so its EMA magnitude tracks
+                            # the supervised loss's EMA magnitude, then still apply ssod_weight on
+                            # top. Orthogonal to EfficientTeacherLoss's own cls_loss_denom -- this
+                            # rescales the already-computed total unsupervised loss, it does not
+                            # change how that loss was normalized internally.
+                            l_sup_val = float(loss.sum().item())
+                            l_unsup_val = float(loss_unlabeled.sum().item())
+                            self.ema_loss_sup = (
+                                l_sup_val if self.ema_loss_sup is None
+                                else self.loss_balance_beta * self.ema_loss_sup + (1 - self.loss_balance_beta) * l_sup_val
+                            )
+                            self.ema_loss_unsup = (
+                                l_unsup_val if self.ema_loss_unsup is None
+                                else self.loss_balance_beta * self.ema_loss_unsup + (1 - self.loss_balance_beta) * l_unsup_val
+                            )
+                            balance_factor = self.ema_loss_sup / max(self.ema_loss_unsup, 1e-6)
+                            self.loss = loss.sum() + self.ssod_weight * balance_factor * loss_unlabeled.sum()
+                        else:
+                            self.loss = loss.sum() + self.ssod_weight * loss_unlabeled.sum()
                         if RANK != -1:
                             self.loss *= self.world_size
                         self.tloss = loss_items_det if self.tloss is None else (self.tloss * i + loss_items_det) / (i + 1)
@@ -933,11 +1448,131 @@ class SSODTrainer(BaseTrainer):
                             else (self.tloss_unlabeled * i + loss_items_unlabeled_det) / (i + 1)
                         )
 
+                        # ===== SSOD training-dynamics diagnostics (see ssod_diagnostics.py) =====
+                        # Everything logged here only exists during this live forward/assignment
+                        # pass -- it cannot be recomputed later from a checkpoint or from running
+                        # inference, unlike validation metrics or PR curves.
+                        if RANK in {-1, 0}:
+                            unsup_stats = self.loss_func_ssod.last_assignment_stats
+                            sup_stats = compute_supervised_assignment_stats(
+                                unwrap_model(self.model).criterion, preds, labeled_batch
+                            )
+                            self.ssod_diag.log_training_dynamics(
+                                ni,
+                                epoch,
+                                loss_items_det,
+                                loss_items_unlabeled_det,
+                                sup_stats,
+                                unsup_stats,
+                                total_loss=float(self.loss.item()),
+                                teacher_conf_max=teacher_conf_max,
+                                teacher_conf_mean=teacher_conf_mean,
+                                num_teacher_predictions_pre_filter=num_candidates_prenms,
+                                num_teacher_predictions_post_filter=n_post_nms,
+                            )
+                            self.ssod_diag.log_assignment_dynamics(ni, epoch, sup_stats, unsup_stats)
+                            self.ssod_diag.maybe_log_ema(ni, epoch, self.teacher, unwrap_model(self.model))
+                            if _diag_now:
+                                reliable_entropy = unlabeled_dfl_entropy[reliable_mask]
+                                rejected_entropy = unlabeled_dfl_entropy[~reliable_mask]
+                                n_reliable = int(reliable_mask.sum())
+                                self.ssod_diag.maybe_log_pseudo_label_dynamics(
+                                    ni,
+                                    epoch,
+                                    unlabeled_batch["img"].shape[0],
+                                    n_post_nms,  # NMS survivors, before our reliable-confidence gate
+                                    n_reliable,  # adopted as pseudo-labels
+                                    n_post_nms - n_reliable,  # dropped by our confidence/loc-conf gate
+                                    num_candidates_prenms - n_post_nms,  # dropped by NMS's own IoU suppression
+                                    unlabeled_conf.squeeze(-1)[reliable_mask],
+                                    reliable_entropy,
+                                    rejected_entropy,
+                                    self.loss_func_ssod.last_diag,
+                                )
+
+                        # ===== Loss-spike causal diagnosis (no-op unless spike_diag_enabled) =====
+                        if self.spike_diag_enabled and RANK in {-1, 0}:
+                            ssod_cls_loss_value = float(loss_items_unlabeled_det[1])  # order: box, cls, dfl
+                            is_trigger = self.spike_diag_intervention_iter == ni or ssod_cls_loss_value > self.spike_diag_threshold
+                            norm_s = norm_u = cos_su = r_t = None
+                            if is_trigger:
+                                # Only pay for the extra backward passes when something is actually
+                                # interesting (a spike, or the pre-designated intervention iteration).
+                                norm_s, norm_u, cos_su, r_t = compute_split_gradients(
+                                    unwrap_model(self.model), loss.sum(), self.ssod_weight * loss_unlabeled.sum()
+                                )
+
+                            n_pseudo = int(unlabeled_bboxes.shape[0])
+                            n_imgs_pseudo = int(unlabeled_batch_idx.unique().numel()) if unlabeled_batch_idx.numel() else 0
+                            log_iteration_stats(
+                                self.spike_diag_log_path,
+                                {
+                                    "epoch": epoch,
+                                    "iteration": ni,
+                                    "ssod_box_loss": float(loss_items_unlabeled_det[0]),
+                                    "ssod_cls_loss": ssod_cls_loss_value,
+                                    "ssod_dfl_loss": float(loss_items_unlabeled_det[2]),
+                                    "sup_box_loss": float(loss_items_det[0]),
+                                    "sup_cls_loss": float(loss_items_det[1]),
+                                    "sup_dfl_loss": float(loss_items_det[2]),
+                                    "lr": self.optimizer.param_groups[0]["lr"],
+                                    "num_pseudo_boxes": n_pseudo,
+                                    "num_images_with_pseudo": n_imgs_pseudo,
+                                    "pseudo_boxes_per_image": n_pseudo / max(n_imgs_pseudo, 1),
+                                    "teacher_conf_mean": float(unlabeled_conf.mean().item()) if unlabeled_conf.numel() else None,
+                                    "teacher_conf_min": float(unlabeled_conf.min().item()) if unlabeled_conf.numel() else None,
+                                    "teacher_conf_max": float(unlabeled_conf.max().item()) if unlabeled_conf.numel() else None,
+                                    "grad_norm_s": norm_s,
+                                    "grad_norm_u": norm_u,
+                                    "cos_su": cos_su,
+                                    "r_t": r_t,
+                                    "scaler_scale": self.scaler.get_scale() if self.amp else None,
+                                },
+                            )
+
+                            if (not self._spike_captured) and ssod_cls_loss_value > self.spike_diag_threshold:
+                                snapshot = snapshot_trainer_state(self, labeled_batch, unlabeled_batch, epoch, ni)
+                                save_snapshot(snapshot, self.spike_diag_snapshot_path)
+                                self._spike_captured = True
+                                LOGGER.info(
+                                    f"[spike_diag] captured pre-spike state at epoch={epoch} ni={ni} "
+                                    f"ssod_cls_loss={ssod_cls_loss_value:.3f} -> {self.spike_diag_snapshot_path}"
+                                )
+                                if self.spike_diag_stop_after_capture:
+                                    raise SpikeCaptured(
+                                        f"epoch={epoch} ni={ni} ssod_cls_loss={ssod_cls_loss_value:.3f} "
+                                        f"snapshot={self.spike_diag_snapshot_path}"
+                                    )
+
+                            if self.spike_diag_intervention_iter == ni and self.spike_diag_intervention != "normal":
+                                self.loss = apply_intervention(
+                                    self.spike_diag_intervention,
+                                    loss.sum(),
+                                    loss_unlabeled.sum(),
+                                    self.ssod_weight,
+                                    self.spike_diag_g_ref,
+                                    norm_u,
+                                )
+                                if RANK != -1:
+                                    self.loss *= self.world_size
+
                     # Backward
                     self.scaler.scale(self.loss).backward()
                     if ni - last_opt_step >= self.accumulate:
                         self.optimizer_step()
                         last_opt_step = ni
+                        # BUG FIX: self.teacher (the pseudo-label-generating EMA) was previously
+                        # never updated after being created at burn-in end -- only its non-weight
+                        # attributes were refreshed via update_attr() once per epoch. It therefore
+                        # stayed frozen at the burn-in snapshot for the entire pseudo-label phase,
+                        # rather than actually tracking the student as a Mean-Teacher EMA is meant
+                        # to. `self.ema` (the separate, checkpoint-saved EMA) was already updated
+                        # correctly inside optimizer_step() above; self.teacher needs the same call.
+                        # (self.teacher does not exist yet during burn-in, hence the guard.)
+                        if getattr(self, "teacher", None) is not None:
+                            self.teacher.update(self.model)
+                        if RANK in {-1, 0}:
+                            self.ssod_diag.log_grad_norm(ni, epoch, self.last_grad_norm, total_loss=float(self.loss.item()))
 
                         # Timed stopping
                         if self.args.time:
@@ -985,7 +1620,15 @@ class SSODTrainer(BaseTrainer):
                         self.run_callbacks("on_batch_end")
                         if self.args.plots and ni in self.plot_idx:
                             self.plot_training_samples(labeled_batch, ni)
-                        if self.args.pseudo_label_plots:
+                        # Only dump pseudo-label visualizations at checkpoint epochs (matching
+                        # save_period) and just the first few batches -- plotting every batch of
+                        # every epoch (the previous behavior) writes tens of thousands of images
+                        # over a full run and synchronously stalls the training loop each time.
+                        if (
+                            self.args.pseudo_label_plots
+                            and epoch % max(self.args.save_period, 1) == 0
+                            and ni < 4
+                        ):
                             pseudo_batch = {}
                             pseudo_batch["img"] = unlabeled_batch["img"]
                             pseudo_batch["cls"] = unlabeled_cls[reliable_mask].squeeze(-1)
@@ -1000,8 +1643,9 @@ class SSODTrainer(BaseTrainer):
                 self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
                 self.run_callbacks("on_train_epoch_end")
+                # See the matching comment in the burn-in branch above: must be set unconditionally.
+                final_epoch = epoch + 1 >= self.epochs
                 if RANK in {-1, 0}:
-                    final_epoch = epoch + 1 >= self.epochs
                     self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
                     self.teacher.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
@@ -1080,6 +1724,8 @@ class SSODTrainer(BaseTrainer):
         if RANK in {-1, 0}:
             if self.args.plots:
                 self.plot_metrics()
+            if getattr(self, "ssod_diag", None) is not None:
+                self.ssod_diag.close()
             self.run_callbacks("on_train_end")
         self._clear_memory()
         unset_deterministic()

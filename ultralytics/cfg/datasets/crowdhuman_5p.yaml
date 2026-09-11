@@ -1,0 +1,15 @@
+# CrowdHuman dataset https://www.crowdhuman.org/ - person detection in crowded scenes.
+# labeled = 5p of train, unlabeled (ssod_train) = the rest, eval = official val split (4370 images).
+# Single class: person (using the full-body "fbox"). Same shuffle seed as crowdhuman_10p.yaml,
+# so this labeled set is a subset of the 10% one.
+# Example usage: yolo train data=crowdhuman_5p.yaml
+
+path: crowdhuman
+train: train_labeled_5p.txt
+ssod_train: train_unlabeled_5p.txt
+val: val.txt
+test: val.txt
+
+# Classes
+names:
+  0: person
