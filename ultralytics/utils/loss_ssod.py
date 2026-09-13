@@ -52,6 +52,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
         skip_zero_pseudo_cls_loss=False,
         cls_loss_denom="target_score_sum",
         ema_denom_beta=0.9,
+        positive_only_cls_loss=False,
     ):
         super().__init__(model)
         self.conf_threshold_high = conf_threshold_high
@@ -103,6 +104,10 @@ class EfficientTeacherLoss(v8DetectionLoss):
         self.cls_loss_denom = cls_loss_denom
         self.ema_denom_beta = ema_denom_beta
         self.ema_target_score_sum = None
+        # Experiment 1 uses an oracle-selected subset of boxes.  In that diagnostic
+        # setting, anchors which are not assigned to one of the selected boxes must
+        # contribute neither a positive nor a background classification target.
+        self.positive_only_cls_loss = positive_only_cls_loss
         self.last_stability_stats = {}
 
     def __call__(
@@ -327,7 +332,14 @@ class EfficientTeacherLoss(v8DetectionLoss):
             # the whole grid and divided by 1 instead of a real normalizer. Skip it entirely.
             loss[1] = torch.zeros((), device=self.device, dtype=dtype)
         else:
-            cls_loss_numerator = (self.bce(pred_scores, target_scores_reliable.to(dtype)).sum(-1) * (~ignore_mask)).sum()
+            cls_loss_per_anchor = self.bce(pred_scores, target_scores_reliable.to(dtype)).sum(-1)
+            if self.positive_only_cls_loss:
+                # Do not turn omitted pseudo objects/regions into hard negatives.  The
+                # box/DFL terms already use fg_mask_reliable, so this makes all three
+                # unlabeled terms selected-positive-only.
+                cls_loss_numerator = cls_loss_per_anchor[fg_mask_reliable].sum()
+            else:
+                cls_loss_numerator = (cls_loss_per_anchor * (~ignore_mask)).sum()
             if compute_extra_diag:
                 # Retained (differentiable) so callers can build normalization-ablation
                 # counterfactual losses from the exact same numerator/model state -- see

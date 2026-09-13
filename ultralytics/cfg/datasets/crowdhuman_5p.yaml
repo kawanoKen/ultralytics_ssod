@@ -4,7 +4,7 @@
 # so this labeled set is a subset of the 10% one.
 # Example usage: yolo train data=crowdhuman_5p.yaml
 
-path: crowdhuman
+path: /work/kawano/ultralytics_ssod/datasets/crowdhuman
 train: train_labeled_5p.txt
 ssod_train: train_unlabeled_5p.txt
 val: val.txt

@@ -301,6 +301,7 @@ def build_dataloader(
         rank (int, optional): Process rank in distributed training. -1 for single-GPU training.
         drop_last (bool, optional): Whether to drop the last incomplete batch.
         pin_memory (bool, optional): Whether to use pinned memory for dataloader.
+        seed (int, optional): Seed used for distributed shuffling and worker RNGs.
 
     Returns:
         (InfiniteDataLoader): A dataloader that can be used for training or validation.

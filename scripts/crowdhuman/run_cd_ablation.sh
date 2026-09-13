@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 DEVICES="0,1,2,3"
-BATCH=256
+BATCH="${BATCH:-128}"
 SAVE_PERIOD=10
 DIAG_INTERVAL=100
 MODEL_1P="runs/crowdhuman_labeled_baseline_1p/yolov8n_crowdhuman_labeled/weights/best.pt"
