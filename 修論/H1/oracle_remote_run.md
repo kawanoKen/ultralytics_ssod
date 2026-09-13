@@ -26,7 +26,7 @@ launcherはw=1をbaseline等価controlとして既定では省略する。今回
 
 ```bash
 RUN_W1_CONTROLS=1 \
-bash scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh --all oracle 0,1,2,3 \
+scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh all oracle 0,1,2,3 \
   > scripts/crowdhuman/logs/h1_oracle_all.log 2>&1
 ```
 

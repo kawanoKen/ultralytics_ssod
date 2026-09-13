@@ -5,9 +5,9 @@
 #   bash scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh oracle 5 0 0,1,2,3
 #
 # One selector's full grid (w={0,1,5,20}, seed={0,1}):
-#   bash scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh --all oracle 0,1,2,3
+#   scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh all oracle 0,1,2,3
 # Both selectors' full grid:
-#   bash scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh --all-both 0,1,2,3
+#   scripts/crowdhuman/run_edge_dfl_dose_response_1p.sh --all-both 0,1,2,3
 #
 # w=1 is an exact baseline-equivalence control. It is included by --all only
 # when RUN_W1_CONTROLS=1 is set, so remote execution can omit duplicate runs.
@@ -54,9 +54,9 @@ run_grid() {
   done
 }
 
-if [[ "${1:-}" == "--all" ]]; then
-  selector="${2:?usage: $0 --all SELECTOR{oracle|dfl} DEVICES}"
-  devices="${3:?usage: $0 --all SELECTOR{oracle|dfl} DEVICES}"
+if [[ "${1:-}" == "all" || "${1:-}" == "--all" ]]; then
+  selector="${2:?usage: $0 all SELECTOR DEVICES}"
+  devices="${3:?usage: $0 all SELECTOR DEVICES}"
   if [[ "${selector}" != "oracle" && "${selector}" != "dfl" ]]; then
     echo "selector must be oracle or dfl" >&2
     exit 2
@@ -72,8 +72,8 @@ if [[ "${1:-}" == "--all-both" ]]; then
   exit 0
 fi
 
-selector="${1:?usage: $0 SELECTOR{oracle|dfl} WEIGHT{0|1|5|20} [SEED] [DEVICES]}"
-weight="${2:?usage: $0 SELECTOR{oracle|dfl} WEIGHT{0|1|5|20} [SEED] [DEVICES]}"
+selector="${1:?usage: $0 SELECTOR WEIGHT [SEED] [DEVICES]}"
+weight="${2:?usage: $0 SELECTOR WEIGHT [SEED] [DEVICES]}"
 seed="${3:-0}"
 devices="${4:-0}"
 if [[ "${selector}" != "oracle" && "${selector}" != "dfl" ]]; then
