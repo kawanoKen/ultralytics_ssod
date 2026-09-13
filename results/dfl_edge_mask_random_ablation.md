@@ -91,43 +91,43 @@ RandomはNo maskのsingle existing seedよりbest mAP50:95で `+0.00142`、DFL-s
 
 ## 4. validation pseudo edgeのGT error
 
-追加学習なしで、既存のNo mask teacher checkpointのvalidation predictionを同一NMS (`conf=0.01`, `IoU=0.65`) で評価した。classification confidenceが0.5以上で、full-body GT IoUが0.5以上のmatched pseudo boxについて、edge confidenceが0.6未満をDFL-maskedとした。
+追加学習なしで、既存のNo mask teacher checkpointのvalidation predictionを同一NMS (`conf=0.01`, `IoU=0.65`) で評価した。classification confidenceが0.5以上で、full-body GT IoUが0.5以上のmatched pseudo boxについて、edge confidenceが0.6未満をDFL-maskedとした。CrowdHumanのfull-body / visible GT boxは、predictionと同じ有効画像座標系で比較できるよう、IoU・edge error・occlusion算出の前に画像境界へclipした。
 
 全edgeをまとめたweighted meanでは次のようになった。medianはedge side間の単純な集約ができないため、下表のside別medianを参照する。
 
 | GT visibility | DFL mask status | n | mean pseudo-to-GT edge error (px) | mean DFL confidence | mean occlusion |
 |---|---|---:|---:|---:|---:|
-| visible | DFL-masked | 99 | 67.27 | 0.518 | 0.008 |
-| visible | non-masked | 146,205 | 9.21 | 0.988 | 0.006 |
-| occluded | DFL-masked | 274 | 53.67 | 0.506 | 0.444 |
-| occluded | non-masked | 47,526 | 32.73 | 0.971 | 0.224 |
+| visible | DFL-masked | 131 | 77.07 | 0.515 | 0.009 |
+| visible | non-masked | 160,271 | 9.36 | 0.988 | 0.006 |
+| occluded | DFL-masked | 295 | 52.64 | 0.507 | 0.426 |
+| occluded | non-masked | 44,111 | 19.57 | 0.968 | 0.220 |
 
 side別の詳細:
 
 | visibility | status | side | n | mean error px | median error px | mean DFL conf | mean occlusion |
 |---|---|---|---:|---:|---:|---:|---:|
-| visible | masked | L | 9 | 105.66 | 90.11 | 0.545 | 0.009 |
-| visible | masked | T | 9 | 55.06 | 54.44 | 0.534 | 0.007 |
-| visible | masked | R | 19 | 87.95 | 71.86 | 0.530 | 0.012 |
-| visible | masked | B | 62 | 57.13 | 36.73 | 0.508 | 0.007 |
-| visible | non-masked | L | 32,643 | 10.64 | 4.86 | 0.991 | 0.008 |
-| visible | non-masked | T | 47,920 | 7.22 | 3.31 | 0.988 | 0.005 |
-| visible | non-masked | R | 34,574 | 9.97 | 4.44 | 0.991 | 0.006 |
-| visible | non-masked | B | 31,068 | 9.92 | 3.84 | 0.980 | 0.005 |
-| occluded | masked | L | 9 | 108.75 | 77.71 | 0.505 | 0.170 |
-| occluded | masked | T | 1 | 13.90 | 13.90 | 0.589 | 0.116 |
-| occluded | masked | R | 11 | 47.18 | 34.39 | 0.537 | 0.246 |
-| occluded | masked | B | 253 | 52.15 | 35.24 | 0.504 | 0.464 |
-| occluded | non-masked | L | 15,865 | 12.34 | 5.87 | 0.988 | 0.147 |
-| occluded | non-masked | T | 596 | 22.82 | 8.94 | 0.979 | 0.106 |
-| occluded | non-masked | R | 13,922 | 14.26 | 6.86 | 0.988 | 0.153 |
-| occluded | non-masked | B | 17,143 | 66.95 | 30.79 | 0.942 | 0.357 |
+| visible | masked | L | 23 | 110.65 | 110.92 | 0.522 | 0.009 |
+| visible | masked | T | 12 | 58.36 | 56.99 | 0.525 | 0.009 |
+| visible | masked | R | 30 | 100.82 | 75.75 | 0.524 | 0.012 |
+| visible | masked | B | 66 | 57.98 | 38.10 | 0.506 | 0.008 |
+| visible | non-masked | L | 35,333 | 11.51 | 4.76 | 0.990 | 0.007 |
+| visible | non-masked | T | 50,514 | 7.47 | 3.34 | 0.988 | 0.005 |
+| visible | non-masked | R | 37,254 | 10.83 | 4.35 | 0.990 | 0.006 |
+| visible | non-masked | B | 37,170 | 8.41 | 3.00 | 0.982 | 0.003 |
+| occluded | masked | L | 18 | 101.80 | 90.49 | 0.507 | 0.186 |
+| occluded | masked | T | 3 | 65.90 | 69.11 | 0.543 | 0.105 |
+| occluded | masked | R | 16 | 51.35 | 40.86 | 0.541 | 0.201 |
+| occluded | masked | B | 258 | 49.14 | 34.30 | 0.504 | 0.460 |
+| occluded | non-masked | L | 15,828 | 12.13 | 5.60 | 0.986 | 0.145 |
+| occluded | non-masked | T | 673 | 16.53 | 7.06 | 0.971 | 0.103 |
+| occluded | non-masked | R | 13,902 | 14.28 | 6.61 | 0.986 | 0.152 |
+| occluded | non-masked | B | 13,708 | 33.69 | 16.64 | 0.928 | 0.382 |
 
-DFL-masked edgeはvisible/occludedの両方でnon-masked edgeより低confidenceかつ平均GT errorが大きい。したがって「低DFL-confidence edgeは難しいpseudo edgeである」という前提は概ね支持される。一方、bottomのstrongly occluded edgeでは、maskedの平均error 52.15 pxがnon-maskedの66.95 pxを下回った。このため、DFL confidenceは全edgeでGT edge errorを完全に順位付けしているわけではなく、bottomについては単純なconfidence-error対応に例外がある。
+DFL-masked edgeはvisible/occludedの両方でnon-masked edgeより低confidenceかつ平均GT errorが大きい。特にoccluded bottomではmasked 49.14 px、non-masked 33.69 pxである。したがって「低DFL-confidence edgeは難しいpseudo edgeである」という前提は概ね支持される。旧集計にあったbottomでの逆転は、画像外へ伸びるGT boxを未clipで比較したことによるアーティファクトだった。
 
 詳細CSV:
 
-- [pseudo masked/non-masked edge error](/work/kawano/LA/ultralytics_ssod/results/dfl_edge_mask_random_ablation/pseudo_masked_edge_error_1p.csv)
+- [pseudo masked/non-masked edge error, GT clipped](/work/kawano/LA/ultralytics_ssod/results/dfl_edge_mask_random_ablation/pseudo_masked_edge_error_1p_clipped.csv)
 
 ## 5. 保存したloss / pseudo-label情報
 
@@ -152,4 +152,4 @@ DFL-selected > Random count-matched > No mask
 
 したがって、DFL supervisionを減らすregularization効果は一部あり得るが、DFL confidenceでedgeを選ぶことにも平均で `+0.00365` の追加差が残った。ただし、RandomとDFL-selectedのseed別結果は混在し、No maskは1 seedのみなので、現時点では「DFL固有のselection効果を支持するが、効果量は小さくseed variationも大きい」という結論が妥当である。
 
-今回のvalidation pseudo解析は、DFL-masked edgeが実際に難しいedgeを多く含むことを確認した。一方でbottom edgeにはconfidenceとGT errorの逆転もあるため、DFL confidenceを遮蔽edgeの完全なoracleとみなすことはできない。
+今回のvalidation pseudo解析は、DFL-masked edgeが実際に難しいedgeを多く含むことを確認した。DFL confidenceを遮蔽edgeの完全なoracleとはみなせないが、GT clip後にもbottomを含む全sideで「masked edgeほどpseudo-to-GT errorが大きい」という方向は維持された。

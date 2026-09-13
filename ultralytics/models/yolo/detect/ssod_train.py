@@ -141,6 +141,11 @@ class SSODTrainer(BaseTrainer):
         self.use_edge_conf = self.args.use_edge_conf
         self.edge_conf_threshold = self.args.edge_conf_threshold
         self.edge_conf_mask_mode = self.args.edge_conf_mask_mode
+        self.edge_dfl_reweight = self.args.edge_dfl_reweight
+        self.edge_dfl_selector = self.args.edge_dfl_selector
+        self.edge_dfl_weight = self.args.edge_dfl_weight
+        self.edge_dfl_normalize = self.args.edge_dfl_normalize
+        self.oracle_edge_error_threshold = self.args.oracle_edge_error_threshold
         self.spike_diag_enabled = self.args.spike_diag_enabled
         self.spike_diag_threshold = self.args.spike_diag_threshold
         self.spike_diag_stop_after_capture = self.args.spike_diag_stop_after_capture
@@ -853,6 +858,11 @@ class SSODTrainer(BaseTrainer):
             use_edge_conf=self.use_edge_conf,
             edge_conf_threshold=self.edge_conf_threshold,
             edge_conf_mask_mode=self.edge_conf_mask_mode,
+            edge_dfl_reweight=self.edge_dfl_reweight,
+            edge_dfl_selector=self.edge_dfl_selector,
+            edge_dfl_weight=self.edge_dfl_weight,
+            edge_dfl_normalize=self.edge_dfl_normalize,
+            oracle_edge_error_threshold=self.oracle_edge_error_threshold,
             assignment_stability_method=self.assignment_stability_method,
             skip_zero_pseudo_cls_loss=self.skip_zero_pseudo_cls_loss,
             cls_loss_denom=self.cls_loss_denom,
@@ -1399,6 +1409,9 @@ class SSODTrainer(BaseTrainer):
                             unlabeled_loc_conf,
                             unlabeled_edge_conf,
                             unlabeled_candidate_bboxes,
+                            unlabeled_batch["bboxes"],
+                            unlabeled_batch["cls"],
+                            unlabeled_batch["batch_idx"].unsqueeze(-1),
                             compute_extra_diag=_diag_now,
                         )
                         if self.assignment_stability_method != "off" and RANK in {-1, 0}:
@@ -1422,6 +1435,7 @@ class SSODTrainer(BaseTrainer):
                         loss_items_det = self.loss_items.detach().cpu().numpy()
                         loss_items_unlabeled_det = self.loss_items_unlabeled.detach().cpu().numpy()
 
+                        effective_balance_factor = 1.0
                         if self.loss_balancing_mode == "ema_scale":
                             # Zoph et al.-style loss-scale matching: instead of a fixed
                             # ssod_weight, scale the unsupervised loss so its EMA magnitude tracks
@@ -1440,9 +1454,15 @@ class SSODTrainer(BaseTrainer):
                                 else self.loss_balance_beta * self.ema_loss_unsup + (1 - self.loss_balance_beta) * l_unsup_val
                             )
                             balance_factor = self.ema_loss_sup / max(self.ema_loss_unsup, 1e-6)
+                            effective_balance_factor = balance_factor
                             self.loss = loss.sum() + self.ssod_weight * balance_factor * loss_unlabeled.sum()
                         else:
                             self.loss = loss.sum() + self.ssod_weight * loss_unlabeled.sum()
+                        if self.edge_dfl_reweight:
+                            self.loss_func_ssod.last_assignment_stats["edge_dfl_loss_balance_factor"] = effective_balance_factor
+                            self.loss_func_ssod.last_assignment_stats["edge_dfl_final_contribution"] = float(
+                                self.ssod_weight * effective_balance_factor * loss_unlabeled[2].detach()
+                            )
                         if RANK != -1:
                             self.loss *= self.world_size
                         self.tloss = loss_items_det if self.tloss is None else (self.tloss * i + loss_items_det) / (i + 1)

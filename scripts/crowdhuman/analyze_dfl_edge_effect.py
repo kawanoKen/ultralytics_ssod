@@ -25,6 +25,7 @@ import torch
 from ultralytics.data.augment import LetterBox
 from ultralytics.models.yolo.detect.ssod_train import xyxy_to_xywh
 from ultralytics.utils.dfl_confidence import localization_confidence
+from ultralytics.utils.edge_dfl_reweight import clip_xyxy
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.tal import make_anchors
 
@@ -67,9 +68,20 @@ def vbox_ltrb(box: dict[str, Any]) -> np.ndarray | None:
     return np.asarray([x, y, x + w, y + h], dtype=np.float32)
 
 
+def clip_ltrb(box: np.ndarray, image_w: int, image_h: int) -> np.ndarray:
+    """Clip an absolute XYXY annotation box to the valid image region.
+
+    CrowdHuman fbox/vbox annotations can extend beyond an image boundary.  Model
+    predictions are clipped when mapped back from letterbox space, so GT must be
+    clipped too before IoU, edge-error, size, or occlusion calculations.
+    """
+    return clip_xyxy(box, image_h, image_w)
+
+
 def gt_features(box: dict[str, Any], image_w: int, image_h: int) -> dict[str, Any]:
-    full = fbox_ltrb(box)
-    visible = vbox_ltrb(box)
+    full = clip_ltrb(fbox_ltrb(box), image_w, image_h)
+    raw_visible = vbox_ltrb(box)
+    visible = clip_ltrb(raw_visible, image_w, image_h) if raw_visible is not None else None
     if visible is None:
         occ = np.full(4, np.nan, dtype=np.float32)
         visible_ratio = np.nan
@@ -344,6 +356,7 @@ def pseudo_analysis(
             "reliable_edge_partial_boxes": total_edge_partial, "reliable_edge_all_low_boxes": total_edge_all_low,
             "conf_low": CONF_LOW, "conf_high": CONF_HIGH, "nms_conf": NMS_CONF, "nms_iou": NMS_IOU,
             "edge_threshold": EDGE_THRESHOLD,
+            "gt_box_policy": "fbox and vbox are clipped to image bounds before GT-derived calculations.",
             "note": "Actual use_edge_conf does not change reliable/unreliable selection; it only masks DFL edges.",
         }, f, indent=2)
 

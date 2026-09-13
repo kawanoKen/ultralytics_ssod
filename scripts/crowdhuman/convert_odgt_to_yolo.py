@@ -11,7 +11,10 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
+
+from ultralytics.utils.edge_dfl_reweight import clip_xyxy
 
 
 def convert(odgt_path: Path, images_dir: Path, labels_dir: Path) -> None:
@@ -34,11 +37,10 @@ def convert(odgt_path: Path, images_dir: Path, labels_dir: Path) -> None:
                 if box["tag"] != "person":
                     continue
                 x, y, bw, bh = box["fbox"]
-                # clip to image bounds before normalizing
-                x = max(0, x)
-                y = max(0, y)
-                bw = min(bw, w - x)
-                bh = min(bh, h - y)
+                x1, y1, x2, y2 = clip_xyxy(
+                    np.asarray([x, y, x + bw, y + bh], dtype=np.float32), h, w
+                )
+                x, y, bw, bh = float(x1), float(y1), float(x2 - x1), float(y2 - y1)
                 if bw <= 0 or bh <= 0:
                     continue
                 cx = (x + bw / 2) / w

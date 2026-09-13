@@ -51,6 +51,15 @@ def main() -> None:
         choices=["selected", "random"],
         help="per-edge DFL mask selection: DFL-selected positions or count-matched random positions",
     )
+    parser.add_argument(
+        "--edge-dfl-reweight",
+        action="store_true",
+        help="enable selector-independent edge-wise DFL dose-response weighting",
+    )
+    parser.add_argument("--edge-dfl-selector", choices=["oracle", "dfl"], default="dfl")
+    parser.add_argument("--edge-dfl-weight", type=float, default=1.0)
+    parser.add_argument("--no-edge-dfl-normalize", action="store_true")
+    parser.add_argument("--oracle-edge-error-threshold", type=float, default=0.10)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--save_period", type=int, default=10)
     parser.add_argument("--project", default="runs/voc_ssod")
@@ -114,6 +123,11 @@ def main() -> None:
         use_edge_conf=use_edge_conf,
         edge_conf_threshold=EDGE_CONF_THRESHOLD,
         edge_conf_mask_mode=args.edge_conf_mask_mode,
+        edge_dfl_reweight=args.edge_dfl_reweight,
+        edge_dfl_selector=args.edge_dfl_selector,
+        edge_dfl_weight=args.edge_dfl_weight,
+        edge_dfl_normalize=not args.no_edge_dfl_normalize,
+        oracle_edge_error_threshold=args.oracle_edge_error_threshold,
         ssod_weight=args.ssod_weight,
         skip_zero_pseudo_cls_loss=args.skip_zero_pseudo_cls_loss,
         cls_loss_denom=args.cls_loss_denom,

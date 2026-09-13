@@ -3,6 +3,13 @@ from ultralytics.utils.tal import make_anchors, bbox2dist
 from ultralytics.utils.metrics import bbox_iou
 from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.assignment_stability import assignment_stability
+from ultralytics.utils.edge_dfl_reweight import (
+    dfl_per_edge_loss,
+    make_edge_dfl_weights,
+    oracle_selected_edges,
+    reduce_weighted_dfl,
+    select_dfl_low_confidence_edges,
+)
 import time
 import torch
 import torch.nn.functional as F
@@ -36,6 +43,11 @@ class EfficientTeacherLoss(v8DetectionLoss):
         use_edge_conf=False,
         edge_conf_threshold=0.6,
         edge_conf_mask_mode="selected",
+        edge_dfl_reweight=False,
+        edge_dfl_selector="dfl",
+        edge_dfl_weight=1.0,
+        edge_dfl_normalize=True,
+        oracle_edge_error_threshold=0.10,
         assignment_stability_method="off",
         skip_zero_pseudo_cls_loss=False,
         cls_loss_denom="target_score_sum",
@@ -51,6 +63,18 @@ class EfficientTeacherLoss(v8DetectionLoss):
         if edge_conf_mask_mode not in {"selected", "random"}:
             raise ValueError(f"edge_conf_mask_mode must be selected or random, got {edge_conf_mask_mode!r}")
         self.edge_conf_mask_mode = edge_conf_mask_mode
+        self.edge_dfl_reweight = edge_dfl_reweight
+        if edge_dfl_selector not in {"oracle", "dfl"}:
+            raise ValueError(f"edge_dfl_selector must be oracle or dfl, got {edge_dfl_selector!r}")
+        if edge_dfl_weight < 0:
+            raise ValueError(f"edge_dfl_weight must be non-negative, got {edge_dfl_weight}")
+        if oracle_edge_error_threshold < 0:
+            raise ValueError(f"oracle_edge_error_threshold must be non-negative, got {oracle_edge_error_threshold}")
+        self.edge_dfl_selector = edge_dfl_selector
+        self.edge_dfl_weight = float(edge_dfl_weight)
+        self.edge_dfl_normalize = edge_dfl_normalize
+        self.oracle_edge_error_threshold = float(oracle_edge_error_threshold)
+        self.edge_dfl_zero_sum_batches = 0
         if assignment_stability_method not in {"off", "r1", "r2"}:
             raise ValueError(f"assignment_stability_method must be off, r1, or r2, got {assignment_stability_method!r}")
         self.assignment_stability_method = assignment_stability_method
@@ -91,6 +115,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
         unlabeled_loc_conf=None,
         unlabeled_edge_conf=None,
         unlabeled_candidate_bboxes=None,
+        oracle_gt_bboxes=None,
+        oracle_gt_cls=None,
+        oracle_gt_batch_idx=None,
         compute_extra_diag=False,
     ):
         """
@@ -112,6 +139,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
                 sampled at random among eligible foreground anchors.
             unlabeled_candidate_bboxes: [num_unlabeled_boxes, 9, 4] normalized XYWH boxes. Candidate
                 zero is the expectation and the other eight are deterministic one-edge Q10/Q90 boxes.
+            oracle_gt_bboxes / oracle_gt_cls / oracle_gt_batch_idx: transformed dataset GT in the
+                student loss coordinate system. Used exclusively by the Oracle edge selector when
+                ``edge_dfl_reweight=True`` and ``edge_dfl_selector="oracle"``.
         """
 
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
@@ -248,7 +278,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
         # selected counts from the DFL mask and samples positions independently of confidence.
         # Initialize these fields for empty-foreground batches as well, keeping CSV columns stable.
         self.last_edge_mask_stats = {
-            "edge_mask_mode": self.edge_conf_mask_mode if self.use_edge_conf else "disabled",
+            "edge_mask_mode": "bypassed_by_edge_dfl_reweight" if self.edge_dfl_reweight else (
+                self.edge_conf_mask_mode if self.use_edge_conf else "disabled"
+            ),
             "edge_mask_eligible_edges": 0,
             "edge_mask_reliable_boxes": int(reliable_mask.sum()),
             "edge_mask_target_total": 0,
@@ -263,6 +295,8 @@ class EfficientTeacherLoss(v8DetectionLoss):
             "edge_mask_applied_B": 0,
         }
         self.last_assignment_stats.update(self.last_edge_mask_stats)
+        self.last_edge_dfl_stats = self._empty_edge_dfl_reweight_stats(reliable_mask)
+        self.last_assignment_stats.update(self.last_edge_dfl_stats)
         self.last_diag = None
         if compute_extra_diag:
             self.last_diag = self._compute_negative_supervision_bins(
@@ -323,7 +357,66 @@ class EfficientTeacherLoss(v8DetectionLoss):
                 loss[1] = cls_loss_numerator / target_scores_sum_reliable
         # Bbox loss
         if fg_mask_reliable.sum():
-            if self.assignment_stability_method in {"r1", "r2"}:
+            if self.edge_dfl_reweight:
+                if self.assignment_stability_method != "off":
+                    raise ValueError("edge_dfl_reweight cannot be combined with assignment_stability_method")
+                selected_per_pseudo, oracle_matched = self._selected_edges_for_reliable_pseudos(
+                    unlabeled_batch_idx,
+                    unlabeled_edge_conf,
+                    reliable_mask,
+                    reliable_gt_bboxes,
+                    reliable_gt_labels,
+                    reliable_mask_gt,
+                    imgsz,
+                    oracle_gt_bboxes,
+                    oracle_gt_cls,
+                    oracle_gt_batch_idx,
+                )
+                selected_edge_mask = self._map_pseudo_edge_values_to_foreground(
+                    selected_per_pseudo, target_gt_idx_reliable, fg_mask_reliable
+                )
+                edge_weight_result = make_edge_dfl_weights(
+                    selected_edge_mask, self.edge_dfl_weight, self.edge_dfl_normalize
+                )
+                if edge_weight_result.normalization_zero_sum:
+                    self.edge_dfl_zero_sum_batches += 1
+                self.last_edge_dfl_stats = self._edge_dfl_reweight_stats(
+                    selected_edge_mask,
+                    edge_weight_result,
+                    pred_distri,
+                    anchor_points,
+                    target_bboxes_reliable,
+                    target_scores_reliable,
+                    target_scores_sum_reliable,
+                    fg_mask_reliable,
+                    oracle_matched,
+                    reliable_mask,
+                )
+                self.last_assignment_stats.update(self.last_edge_dfl_stats)
+                # Exact baseline path is intentionally delegated to BboxLoss. This makes w=1
+                # bit-identical to the ordinary SSOD loss even when a selector is active.
+                if self.edge_dfl_weight == 1.0:
+                    loss[0], loss[2] = self.bbox_loss(
+                        pred_distri,
+                        pred_bboxes,
+                        anchor_points,
+                        target_bboxes_reliable / stride_tensor,
+                        target_scores_reliable,
+                        target_scores_sum_reliable,
+                        fg_mask_reliable,
+                    )
+                else:
+                    loss[0], loss[2] = self._bbox_loss_with_edge_weights(
+                        pred_distri,
+                        pred_bboxes,
+                        anchor_points,
+                        target_bboxes_reliable / stride_tensor,
+                        target_scores_reliable,
+                        target_scores_sum_reliable,
+                        fg_mask_reliable,
+                        edge_weight_result.normalized,
+                    )
+            elif self.assignment_stability_method in {"r1", "r2"}:
                 loss[0], loss[2] = self._bbox_loss_with_stability(
                     pred_distri,
                     pred_bboxes,
@@ -468,6 +561,154 @@ class EfficientTeacherLoss(v8DetectionLoss):
             if n_j := matches.sum():
                 out[j, :n_j] = values[matches]
         return out
+
+    def _empty_edge_dfl_reweight_stats(self, reliable_mask):
+        """Stable diagnostic schema, including empty-foreground batches."""
+        return {
+            "edge_dfl_reweight_enabled": bool(self.edge_dfl_reweight),
+            "edge_dfl_selector": self.edge_dfl_selector if self.edge_dfl_reweight else "disabled",
+            "edge_dfl_selected_weight": self.edge_dfl_weight if self.edge_dfl_reweight else 1.0,
+            "edge_dfl_normalize": bool(self.edge_dfl_normalize) if self.edge_dfl_reweight else False,
+            "edge_dfl_legacy_mask_bypassed": bool(self.edge_dfl_reweight and self.use_edge_conf),
+            "edge_dfl_reliable_boxes": int(reliable_mask.sum()),
+            "edge_dfl_oracle_matched_pseudo_boxes": 0,
+            "edge_dfl_eligible_edges": 0,
+            "edge_dfl_selected_edges": 0,
+            "edge_dfl_selected_edge_rate": 0.0,
+            "edge_dfl_raw_weight_mean": 1.0,
+            "edge_dfl_normalized_weight_mean": 1.0,
+            "edge_dfl_selected_normalized_weight_mean": 0.0,
+            "edge_dfl_nonselected_normalized_weight_mean": 1.0,
+            "edge_dfl_raw_loss": 0.0,
+            "edge_dfl_weighted_raw_loss": 0.0,
+            "edge_dfl_weighted_normalized_loss": 0.0,
+            "edge_dfl_normalization_zero_sum_batch": False,
+            "edge_dfl_normalization_zero_sum_batches": self.edge_dfl_zero_sum_batches,
+            "edge_dfl_loss_balance_factor": 1.0,
+            "edge_dfl_final_contribution": 0.0,
+        }
+
+    def _selected_edges_for_reliable_pseudos(
+        self,
+        unlabeled_batch_idx,
+        unlabeled_edge_conf,
+        reliable_mask,
+        reliable_gt_bboxes,
+        reliable_gt_labels,
+        reliable_mask_gt,
+        imgsz,
+        oracle_gt_bboxes,
+        oracle_gt_cls,
+        oracle_gt_batch_idx,
+    ):
+        """Build a four-edge selector mask per padded reliable pseudo object."""
+        batch_size, n_max_boxes = reliable_gt_bboxes.shape[:2]
+        empty = torch.zeros((batch_size, n_max_boxes, 4), device=reliable_gt_bboxes.device, dtype=torch.bool)
+        oracle_matched = torch.zeros((batch_size, n_max_boxes, 1), device=reliable_gt_bboxes.device, dtype=torch.bool)
+        if n_max_boxes == 0:
+            return empty, oracle_matched
+        if self.edge_dfl_selector == "dfl":
+            if unlabeled_edge_conf is None:
+                raise ValueError("edge_dfl_selector='dfl' requires unlabeled_edge_conf")
+            padded_conf = self._pad_per_image(
+                unlabeled_batch_idx[reliable_mask], unlabeled_edge_conf[reliable_mask], batch_size
+            )
+            return select_dfl_low_confidence_edges(padded_conf, self.edge_conf_threshold), oracle_matched
+        if oracle_gt_bboxes is None or oracle_gt_cls is None or oracle_gt_batch_idx is None:
+            raise ValueError("edge_dfl_selector='oracle' requires transformed oracle GT tensors")
+        oracle_targets = torch.cat((oracle_gt_batch_idx, oracle_gt_cls, oracle_gt_bboxes), 1)
+        oracle_targets = self.preprocess(oracle_targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        oracle_labels, oracle_boxes = oracle_targets.split((1, 4), 2)
+        oracle_valid = oracle_boxes.sum(2, keepdim=True).gt_(0.0)
+        return oracle_selected_edges(
+            reliable_gt_bboxes,
+            reliable_gt_labels,
+            reliable_mask_gt,
+            oracle_boxes,
+            oracle_labels,
+            oracle_valid,
+            image_h=imgsz[0],
+            image_w=imgsz[1],
+            error_threshold=self.oracle_edge_error_threshold,
+            match_iou=0.5,
+        )
+
+    @staticmethod
+    def _map_pseudo_edge_values_to_foreground(padded_values, target_gt_idx, fg_mask):
+        """Use TaskAlignedAssigner's object identity to broadcast values to positives."""
+        if not fg_mask.any():
+            return torch.zeros((0, 4), device=fg_mask.device, dtype=padded_values.dtype)
+        n_max_boxes = padded_values.shape[1]
+        if n_max_boxes == 0:
+            return torch.zeros((int(fg_mask.sum()), 4), device=fg_mask.device, dtype=padded_values.dtype)
+        batch_ind = torch.arange(fg_mask.shape[0], device=fg_mask.device).unsqueeze(-1)
+        flat_idx = target_gt_idx.long() + batch_ind * n_max_boxes
+        return padded_values.reshape(-1, 4)[flat_idx][fg_mask]
+
+    @torch.no_grad()
+    def _edge_dfl_reweight_stats(
+        self,
+        selected_edges,
+        edge_weight_result,
+        pred_dist,
+        anchor_points,
+        target_bboxes,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+        oracle_matched,
+        reliable_mask,
+    ):
+        stats = self._empty_edge_dfl_reweight_stats(reliable_mask)
+        stats["edge_dfl_oracle_matched_pseudo_boxes"] = int(oracle_matched.sum())
+        stats["edge_dfl_eligible_edges"] = int(selected_edges.numel())
+        stats["edge_dfl_selected_edges"] = int(selected_edges.sum())
+        stats["edge_dfl_selected_edge_rate"] = float(selected_edges.float().mean()) if selected_edges.numel() else 0.0
+        stats["edge_dfl_raw_weight_mean"] = float(edge_weight_result.raw.mean()) if edge_weight_result.raw.numel() else 1.0
+        stats["edge_dfl_normalized_weight_mean"] = float(edge_weight_result.normalized.mean()) if edge_weight_result.normalized.numel() else 1.0
+        if selected_edges.any():
+            stats["edge_dfl_selected_normalized_weight_mean"] = float(edge_weight_result.normalized[selected_edges].mean())
+        if (~selected_edges).any():
+            stats["edge_dfl_nonselected_normalized_weight_mean"] = float(edge_weight_result.normalized[~selected_edges].mean())
+        stats["edge_dfl_normalization_zero_sum_batch"] = edge_weight_result.normalization_zero_sum
+        stats["edge_dfl_normalization_zero_sum_batches"] = self.edge_dfl_zero_sum_batches
+        if not selected_edges.numel() or not self.bbox_loss.dfl_loss:
+            return stats
+        reg_max = self.bbox_loss.dfl_loss.reg_max
+        target_ltrb = bbox2dist(anchor_points, target_bboxes, reg_max - 1)[fg_mask]
+        per_edge = dfl_per_edge_loss(pred_dist[fg_mask].view(-1, 4, reg_max), target_ltrb, reg_max)
+        target_weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        ones = torch.ones_like(edge_weight_result.raw)
+        stats["edge_dfl_raw_loss"] = float(reduce_weighted_dfl(per_edge, target_weight, target_scores_sum, ones).detach())
+        stats["edge_dfl_weighted_raw_loss"] = float(
+            reduce_weighted_dfl(per_edge, target_weight, target_scores_sum, edge_weight_result.raw).detach()
+        )
+        stats["edge_dfl_weighted_normalized_loss"] = float(
+            reduce_weighted_dfl(per_edge, target_weight, target_scores_sum, edge_weight_result.normalized).detach()
+        )
+        return stats
+
+    def _bbox_loss_with_edge_weights(
+        self,
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        target_bboxes,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+        edge_weights,
+    ):
+        """Baseline CIoU plus DFL with common weights applied before the edge mean."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        if not self.bbox_loss.dfl_loss:
+            return loss_iou, torch.zeros((), device=pred_dist.device)
+        reg_max = self.bbox_loss.dfl_loss.reg_max
+        target_ltrb = bbox2dist(anchor_points, target_bboxes, reg_max - 1)[fg_mask]
+        per_edge = dfl_per_edge_loss(pred_dist[fg_mask].view(-1, 4, reg_max), target_ltrb, reg_max)
+        return loss_iou, reduce_weighted_dfl(per_edge, weight, target_scores_sum, edge_weights)
 
     def _bbox_loss_with_edge_mask(
         self,
