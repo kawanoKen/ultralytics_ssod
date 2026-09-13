@@ -35,6 +35,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
         loc_conf_threshold=0.6,
         use_edge_conf=False,
         edge_conf_threshold=0.6,
+        edge_conf_mask_mode="selected",
         assignment_stability_method="off",
         skip_zero_pseudo_cls_loss=False,
         cls_loss_denom="target_score_sum",
@@ -47,6 +48,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
         self.loc_conf_threshold = loc_conf_threshold
         self.use_edge_conf = use_edge_conf
         self.edge_conf_threshold = edge_conf_threshold
+        if edge_conf_mask_mode not in {"selected", "random"}:
+            raise ValueError(f"edge_conf_mask_mode must be selected or random, got {edge_conf_mask_mode!r}")
+        self.edge_conf_mask_mode = edge_conf_mask_mode
         if assignment_stability_method not in {"off", "r1", "r2"}:
             raise ValueError(f"assignment_stability_method must be off, r1, or r2, got {assignment_stability_method!r}")
         self.assignment_stability_method = assignment_stability_method
@@ -104,6 +108,8 @@ class EfficientTeacherLoss(v8DetectionLoss):
                 individual edge is skipped if that edge's confidence is below
                 `self.edge_conf_threshold` -- unlike `use_loc_conf` (which gates the whole box),
                 this keeps training the box's other, more confident edges instead of dropping it.
+                With ``edge_conf_mask_mode="random"``, the same per-edge selected counts are
+                sampled at random among eligible foreground anchors.
             unlabeled_candidate_bboxes: [num_unlabeled_boxes, 9, 4] normalized XYWH boxes. Candidate
                 zero is the expectation and the other eight are deterministic one-edge Q10/Q90 boxes.
         """
@@ -238,6 +244,25 @@ class EfficientTeacherLoss(v8DetectionLoss):
         self.last_assignment_stats = self._compute_assignment_stats(
             target_gt_idx_reliable, fg_mask_reliable, reliable_mask_gt, target_scores_reliable, reliable_mask
         )
+        # Training-time diagnostics for the per-edge DFL ablation. The random mode keeps the
+        # selected counts from the DFL mask and samples positions independently of confidence.
+        # Initialize these fields for empty-foreground batches as well, keeping CSV columns stable.
+        self.last_edge_mask_stats = {
+            "edge_mask_mode": self.edge_conf_mask_mode if self.use_edge_conf else "disabled",
+            "edge_mask_eligible_edges": 0,
+            "edge_mask_reliable_boxes": int(reliable_mask.sum()),
+            "edge_mask_target_total": 0,
+            "edge_mask_target_L": 0,
+            "edge_mask_target_T": 0,
+            "edge_mask_target_R": 0,
+            "edge_mask_target_B": 0,
+            "edge_mask_applied_total": 0,
+            "edge_mask_applied_L": 0,
+            "edge_mask_applied_T": 0,
+            "edge_mask_applied_R": 0,
+            "edge_mask_applied_B": 0,
+        }
+        self.last_assignment_stats.update(self.last_edge_mask_stats)
         self.last_diag = None
         if compute_extra_diag:
             self.last_diag = self._compute_negative_supervision_bins(
@@ -320,7 +345,35 @@ class EfficientTeacherLoss(v8DetectionLoss):
                 batch_ind = torch.arange(batch_size, device=target_gt_idx_reliable.device).unsqueeze(-1)
                 flat_gt_idx = target_gt_idx_reliable + batch_ind * n_max_boxes  # (b, h*w)
                 target_edge_conf = padded_edge_conf.view(-1, 4)[flat_gt_idx]  # (b, h*w, 4)
-                edge_mask = target_edge_conf[fg_mask_reliable] >= self.edge_conf_threshold  # (N_fg, 4)
+                selected_edge_mask = target_edge_conf[fg_mask_reliable] >= self.edge_conf_threshold  # (N_fg, 4)
+                edge_mask = selected_edge_mask
+                if self.edge_conf_mask_mode == "random":
+                    # DFL confidence determines counts only; randperm determines positions.
+                    edge_mask = torch.zeros_like(selected_edge_mask)
+                    n_foreground = selected_edge_mask.shape[0]
+                    for edge_idx in range(4):
+                        n_selected = int(selected_edge_mask[:, edge_idx].sum().item())
+                        if n_selected:
+                            random_idx = torch.randperm(n_foreground, device=selected_edge_mask.device)[:n_selected]
+                            edge_mask[random_idx, edge_idx] = True
+                target_counts = selected_edge_mask.sum(0).to(torch.long)
+                applied_counts = edge_mask.sum(0).to(torch.long)
+                self.last_edge_mask_stats = {
+                    "edge_mask_mode": self.edge_conf_mask_mode,
+                    "edge_mask_eligible_edges": int(selected_edge_mask.numel()),
+                    "edge_mask_reliable_boxes": int(reliable_mask.sum()),
+                    "edge_mask_target_total": int(selected_edge_mask.sum()),
+                    "edge_mask_target_L": int(target_counts[0]),
+                    "edge_mask_target_T": int(target_counts[1]),
+                    "edge_mask_target_R": int(target_counts[2]),
+                    "edge_mask_target_B": int(target_counts[3]),
+                    "edge_mask_applied_total": int(edge_mask.sum()),
+                    "edge_mask_applied_L": int(applied_counts[0]),
+                    "edge_mask_applied_T": int(applied_counts[1]),
+                    "edge_mask_applied_R": int(applied_counts[2]),
+                    "edge_mask_applied_B": int(applied_counts[3]),
+                }
+                self.last_assignment_stats.update(self.last_edge_mask_stats)
                 loss[0], loss[2] = self._bbox_loss_with_edge_mask(
                     pred_distri,
                     pred_bboxes,

@@ -55,7 +55,7 @@ def generate_ddp_file(trainer):
         "ssod", "ssod_weight", "batch_ssod", "mosaic_ssod", "mixup_ssod", "cutmix_ssod",
         "burn_in_epochs", "conf_threshold_high", "conf_threshold_low", "domain_adaptation",
         "pseudo_label_plots", "da/loss_s", "da/loss_t", "da/loss", "da_loss_weights",
-        "use_loc_conf", "loc_conf_threshold", "use_edge_conf", "edge_conf_threshold",
+        "use_loc_conf", "loc_conf_threshold", "use_edge_conf", "edge_conf_threshold", "edge_conf_mask_mode",
         "assignment_stability_method", "assignment_perturbation"
     }
     use_ssod_cfg = any(k in _ov for k in _ssod_keys)

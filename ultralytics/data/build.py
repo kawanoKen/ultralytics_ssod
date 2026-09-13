@@ -288,6 +288,7 @@ def build_dataloader(
     rank: int = -1,
     drop_last: bool = False,
     pin_memory: bool = True,
+    seed: int | None = None,
 ):
     """
     Create and return an InfiniteDataLoader or DataLoader for training or validation.
@@ -315,12 +316,12 @@ def build_dataloader(
     sampler = (
         None
         if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle)
+        else distributed.DistributedSampler(dataset, shuffle=shuffle, seed=0 if seed is None else seed)
         if shuffle
         else ContiguousDistributedSampler(dataset)
     )
     generator = torch.Generator()
-    generator.manual_seed(6148914691236517205 + RANK)
+    generator.manual_seed(6148914691236517205 + RANK + (0 if seed is None else seed))
     return InfiniteDataLoader(
         dataset=dataset,
         batch_size=batch,

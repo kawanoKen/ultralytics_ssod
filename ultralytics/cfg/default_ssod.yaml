@@ -172,6 +172,7 @@ loc_conf_threshold: 0.6 # (float) DFL box-level localization confidence threshol
 use_edge_conf: False # (bool) per-edge DFL confidence masking: skip only the low-confidence edges of a
                      #        reliable box's DFL loss, instead of dropping the whole box (use_loc_conf)
 edge_conf_threshold: 0.6 # (float) per-edge DFL confidence threshold below which that edge is excluded from the DFL loss
+edge_conf_mask_mode: selected # (str) selected=DFL-ranked edges; random=count-matched random edge positions
 
 # Assignment stability: off=existing behavior, r1=stability-weighted box/DFL, r2=R1 + ambiguous-negative ignore.
 # The 9 deterministic candidates are fixed to expectation and one-edge Q10/Q90 perturbations.

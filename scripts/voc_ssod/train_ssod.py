@@ -43,6 +43,14 @@ def main() -> None:
     parser.add_argument("--device", default="0,1")
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--batch_ssod", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--edge-conf-mask-mode",
+        default="selected",
+        choices=["selected", "random"],
+        help="per-edge DFL mask selection: DFL-selected positions or count-matched random positions",
+    )
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--save_period", type=int, default=10)
     parser.add_argument("--project", default="runs/voc_ssod")
@@ -105,6 +113,7 @@ def main() -> None:
         loc_conf_threshold=LOC_CONF_THRESHOLD,
         use_edge_conf=use_edge_conf,
         edge_conf_threshold=EDGE_CONF_THRESHOLD,
+        edge_conf_mask_mode=args.edge_conf_mask_mode,
         ssod_weight=args.ssod_weight,
         skip_zero_pseudo_cls_loss=args.skip_zero_pseudo_cls_loss,
         cls_loss_denom=args.cls_loss_denom,
@@ -116,6 +125,8 @@ def main() -> None:
         imgsz=args.imgsz,
         batch=args.batch,
         batch_ssod=args.batch_ssod,
+        seed=args.seed,
+        resume=args.resume,
         device=args.device,
         save_period=args.save_period,
         project=args.project,

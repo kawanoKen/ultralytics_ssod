@@ -140,6 +140,7 @@ class SSODTrainer(BaseTrainer):
         self.loc_conf_threshold = self.args.loc_conf_threshold
         self.use_edge_conf = self.args.use_edge_conf
         self.edge_conf_threshold = self.args.edge_conf_threshold
+        self.edge_conf_mask_mode = self.args.edge_conf_mask_mode
         self.spike_diag_enabled = self.args.spike_diag_enabled
         self.spike_diag_threshold = self.args.spike_diag_threshold
         self.spike_diag_stop_after_capture = self.args.spike_diag_stop_after_capture
@@ -219,6 +220,7 @@ class SSODTrainer(BaseTrainer):
                 shuffle=shuffle,
                 rank=rank,
                 drop_last=drop_last,
+                seed=self.args.seed,
             )
 
     def preprocess_batch(self, batch: dict) -> dict:
@@ -850,6 +852,7 @@ class SSODTrainer(BaseTrainer):
             loc_conf_threshold=self.loc_conf_threshold,
             use_edge_conf=self.use_edge_conf,
             edge_conf_threshold=self.edge_conf_threshold,
+            edge_conf_mask_mode=self.edge_conf_mask_mode,
             assignment_stability_method=self.assignment_stability_method,
             skip_zero_pseudo_cls_loss=self.skip_zero_pseudo_cls_loss,
             cls_loss_denom=self.cls_loss_denom,
