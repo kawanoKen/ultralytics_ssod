@@ -182,6 +182,12 @@ edge_dfl_weight: 1.0 # (float) selected-edge relative DFL weight; intended value
 edge_dfl_normalize: True # (bool) keep mean edge weight at one; false reproduces unnormalized masking/reweighting
 oracle_edge_error_threshold: 0.10 # (float) normalized pseudo-to-GT edge error threshold for oracle selection
 
+# H0: fully supervised artificial boundary-noise mechanism experiment.
+h0_boundary_noise: False # (bool) replace the normal detection loss with H0 noisy-edge DFL ON/OFF loss
+h0_noise_fraction: 0.0 # (float) low/high relative edge noise scale; must be positive when H0 is enabled
+h0_dfl_mode: on # (str) choices: on (noisy DFL target), off (mask corrupted DFL edge), clean (clean DFL target; noisy IoU)
+h0_corruption_seed: 20260914 # (int) fixed hash seed for paired corruption map
+
 # Assignment stability: off=existing behavior, r1=stability-weighted box/DFL, r2=R1 + ambiguous-negative ignore.
 # The 9 deterministic candidates are fixed to expectation and one-edge Q10/Q90 perturbations.
 assignment_stability_method: "off" # (str) choices: off, r1, r2

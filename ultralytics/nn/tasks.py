@@ -497,6 +497,10 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        if getattr(self.args, "h0_boundary_noise", False):
+            from ultralytics.utils.loss_h0 import H0BoundaryNoiseLoss
+
+            return H0BoundaryNoiseLoss(self)
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
