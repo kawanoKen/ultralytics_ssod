@@ -185,6 +185,7 @@ oracle_edge_error_threshold: 0.10 # (float) normalized pseudo-to-GT edge error t
 # H0: fully supervised artificial boundary-noise mechanism experiment.
 h0_boundary_noise: False # (bool) replace the normal detection loss with H0 noisy-edge DFL ON/OFF loss
 h0_noise_fraction: 0.0 # (float) low/high relative edge noise scale; must be positive when H0 is enabled
+h0_outward_probability: 0.5 # (float) P(outward): l/t decrease, r/b increase; 0.5 keeps legacy symmetric hash
 h0_dfl_mode: on # (str) choices: on (noisy DFL target), off (mask corrupted DFL edge), clean (clean DFL target; noisy IoU)
 h0_corruption_seed: 20260914 # (int) fixed hash seed for paired corruption map
 

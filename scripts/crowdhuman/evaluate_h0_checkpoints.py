@@ -39,7 +39,7 @@ def main() -> None:
     images = list_images(args.root, args.root / "val.txt")
     annotations = load_odgt(args.root / "annotation_val.odgt")
     predictions = {0.5: [], 0.75: []}
-    edge_px, edge_norm = [], []
+    edge_px, edge_norm, signed_edge_px, signed_edge_norm, area_ratios = [], [], [], [], []
     n_gt = 0
     n_matched = 0
     for start in range(0, len(images), args.batch_size):
@@ -74,11 +74,29 @@ def main() -> None:
                     continue
                 used.add(gi); n_matched += 1
                 denom = np.asarray([gt[gi, 2]-gt[gi, 0], gt[gi, 3]-gt[gi, 1], gt[gi, 2]-gt[gi, 0], gt[gi, 3]-gt[gi, 1]], dtype=np.float32)
-                errors = np.abs(box - gt[gi])
+                signed = box - gt[gi]  # l/t: positive=inward; r/b: positive=outward.
+                errors = np.abs(signed)
                 edge_px.extend(errors.tolist()); edge_norm.extend((errors / np.maximum(denom, 1)).tolist())
+                signed_edge_px.append(signed)
+                signed_edge_norm.append(signed / np.maximum(denom, 1))
+                pred_area = max((box[2] - box[0]) * (box[3] - box[1]), 0.0)
+                gt_area = max((gt[gi, 2] - gt[gi, 0]) * (gt[gi, 3] - gt[gi, 1]), 1.0)
+                area_ratios.append(pred_area / gt_area)
         if start % 400 == 0:
             print(f"{args.checkpoint.name}: {min(start + args.batch_size, len(images))}/{len(images)}", flush=True)
-    out = {"checkpoint": str(args.checkpoint), "images": len(images), "gt_boxes": n_gt, "matched_detections_iou50": n_matched, "AP50_custom": ap(predictions[0.5], n_gt), "AP75_custom": ap(predictions[0.75], n_gt), "edge_error_px_mean": float(np.mean(edge_px)), "edge_error_px_median": float(np.median(edge_px)), "edge_error_norm_mean": float(np.mean(edge_norm)), "edge_error_norm_median": float(np.median(edge_norm))}
+    signed_px = np.asarray(signed_edge_px, dtype=np.float64)
+    signed_norm = np.asarray(signed_edge_norm, dtype=np.float64)
+    out = {
+        "checkpoint": str(args.checkpoint), "images": len(images), "gt_boxes": n_gt,
+        "matched_detections_iou50": n_matched, "AP50_custom": ap(predictions[0.5], n_gt),
+        "AP75_custom": ap(predictions[0.75], n_gt), "edge_error_px_mean": float(np.mean(edge_px)),
+        "edge_error_px_median": float(np.median(edge_px)), "edge_error_norm_mean": float(np.mean(edge_norm)),
+        "edge_error_norm_median": float(np.median(edge_norm)), "pred_to_gt_area_ratio_mean": float(np.mean(area_ratios)),
+        "pred_to_gt_area_ratio_median": float(np.median(area_ratios)),
+    }
+    for side, idx in zip(("L", "T", "R", "B"), range(4)):
+        out[f"signed_edge_error_px_{side}_mean"] = float(signed_px[:, idx].mean())
+        out[f"signed_edge_error_norm_{side}_mean"] = float(signed_norm[:, idx].mean())
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(out)); w.writeheader(); w.writerow(out)

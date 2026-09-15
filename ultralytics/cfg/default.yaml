@@ -103,6 +103,7 @@ cls: 0.5 # (float) classification loss gain
 dfl: 1.5 # (float) distribution focal loss gain
 h0_boundary_noise: False # (bool) H0 fully-supervised artificial-boundary-noise loss
 h0_noise_fraction: 0.0 # (float) H0 low/high relative noisy-edge scale
+h0_outward_probability: 0.5 # (float) H0 direction: P(outward); 0.5 retains legacy symmetric hash
 h0_dfl_mode: on # (str) H0: on=noisy target, off=mask corrupted DFL edge, clean=clean DFL target with noisy IoU
 h0_corruption_seed: 20260914 # (int) H0 paired deterministic corruption-map seed
 pose: 12.0 # (float) pose loss gain (pose tasks)

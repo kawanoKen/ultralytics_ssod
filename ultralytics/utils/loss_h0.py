@@ -16,10 +16,13 @@ class H0BoundaryNoiseLoss(v8DetectionLoss):
         super().__init__(model)
         h = model.args
         self.noise_fraction = float(h.h0_noise_fraction)
+        self.outward_probability = float(getattr(h, "h0_outward_probability", 0.5))
         self.dfl_mode = str(h.h0_dfl_mode)
         self.map_seed = int(h.h0_corruption_seed)
         if self.noise_fraction <= 0 or self.dfl_mode not in {"on", "off", "clean"}:
             raise ValueError("H0 requires positive h0_noise_fraction and h0_dfl_mode in {'on', 'off', 'clean'}")
+        if not 0.0 <= self.outward_probability <= 1.0:
+            raise ValueError("h0_outward_probability must be in [0, 1]")
         self.last_h0_stats: dict[str, float] = {}
 
     def _corrupt(self, boxes, labels, valid, imgsz):
@@ -32,13 +35,25 @@ class H0BoundaryNoiseLoss(v8DetectionLoss):
         noisy, edge_mask = boxes.clone(), torch.zeros_like(boxes, dtype=torch.bool)
         valid = valid.squeeze(-1)
         if not valid.any():
-            self.last_h0_stats = {"objects": 0.0, "requested_fraction": 0.0, "applied_fraction": 0.0, "clamped_fraction": 0.0}
+            self.last_h0_stats = {
+                "objects": 0.0, "requested_fraction": 0.0, "applied_fraction": 0.0,
+                "clamped_fraction": 0.0, "outward_fraction": 0.0,
+            }
             return noisy, edge_mask
         q = torch.round(boxes * 16).to(torch.int64)
         h = (q[..., 0] * 73856093 + q[..., 1] * 19349663 + q[..., 2] * 83492791 + q[..., 3] * 2654435761
              + labels.squeeze(-1).to(torch.int64) * 97531 + self.map_seed * 1000003) & 0x7FFFFFFFFFFFFFFF
         edge = (h % 4).long()
-        sign = torch.where(((h // 4) % 2).bool(), 1.0, -1.0).to(boxes.dtype)
+        # Outward is l/t decreasing or r/b increasing; inward is its exact opposite.
+        # p=0.5 preserves the legacy symmetric sign hash exactly, allowing the existing High runs
+        # to remain the paired 50/50 reference.  Biased conditions draw their direction from a
+        # separate deterministic hash component while keeping object, side, and magnitude fixed.
+        outward_sign = torch.where(edge < 2, -1.0, 1.0).to(boxes.dtype)
+        if self.outward_probability == 0.5:
+            sign = torch.where(((h // 4) % 2).bool(), 1.0, -1.0).to(boxes.dtype)
+        else:
+            direction_u = ((h // 1000003) % 1000003).to(boxes.dtype) / 1000002.0
+            sign = torch.where(direction_u < self.outward_probability, outward_sign, -outward_sign)
         # Empirical-scale distribution, fixed before training: Uniform[0.5, 1.5] x scale.
         magnitude = (0.5 + ((h // 8) % 1000003).to(boxes.dtype) / 1000002.0) * self.noise_fraction
         width, height = (boxes[..., 2] - boxes[..., 0]).clamp_min(1), (boxes[..., 3] - boxes[..., 1]).clamp_min(1)
@@ -68,6 +83,7 @@ class H0BoundaryNoiseLoss(v8DetectionLoss):
             "requested_fraction": float((delta.abs()[valid] / scale[valid]).mean()),
             "applied_fraction": float((applied[valid] / scale[valid]).mean()),
             "clamped_fraction": float((applied[valid] + 1e-3 < delta.abs()[valid]).float().mean()),
+            "outward_fraction": float((sign[valid] == outward_sign[valid]).float().mean()),
         }
         return noisy, edge_mask
 
