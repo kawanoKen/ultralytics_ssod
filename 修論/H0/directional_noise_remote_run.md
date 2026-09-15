@@ -4,17 +4,17 @@
 
 clean GTの各boxに1辺だけnoiseを加えるH0で、edge noiseの方向性を操作する。外向きはleft/topを負方向、right/bottomを正方向へ動かしてboxを広げる向き、内向きはその反対である。
 
-DFL targetの効果を切り分けるため、各新規distributionについてNoisy DFL（noisy boxのDFL target）とClean DFL（IoU/assignmentはnoisy box、DFL targetだけclean GT）の両方をseed 0/1で実行する。既存High symmetric（alpha=0.20、外向き確率0.5）は再利用する。
+DFL targetの効果を切り分けるため、各新規distributionについてNoisy DFL（noisy boxのDFL target）とClean DFL（IoU/assignmentはnoisy box、DFL targetだけclean GT）の両方を**seed 0のみ**で実行する。既存High symmetric（alpha=0.20、外向き確率0.5）はseed 0を再利用する。
 
 | tag | alpha | P(outward) | 目的 | 新規run数 |
 |---|---:|---:|---|---:|
-| a20_out100 | 0.20 | 1.00 | 外向き100%の最大効果 | 4 |
-| a20_out0 | 0.20 | 0.00 | 内向き100%の非対称性 | 4 |
-| a20_out80 | 0.20 | 0.80 | 外向きbiasの用量反応 | 4 |
-| a40_out50 | 0.40 | 0.50 | 対称noiseの上限 | 4 |
+| a20_out100 | 0.20 | 1.00 | 外向き100%の最大効果 | 2 |
+| a20_out0 | 0.20 | 0.00 | 内向き100%の非対称性 | 2 |
+| a20_out80 | 0.20 | 0.80 | 外向きbiasの用量反応 | 2 |
+| a40_out50 | 0.40 | 0.50 | 対称noiseの上限 | 2 |
 | a20_out50 | 0.20 | 0.50 | 既存High symmetric control | 0 |
 
-新規は計16 runである。noise絶対値は各対象box辺の `Uniform[0.5, 1.5] × alpha`、対象edgeは一様、noise map seedは全条件で20260914に固定する。
+新規は計8 runである。noise絶対値は各対象box辺の `Uniform[0.5, 1.5] × alpha`、対象edgeは一様、noise map seedは全条件で20260914に固定する。
 
 ## 実行
 

@@ -11,11 +11,10 @@ devices="${1:-0,1,2,3}"
 for spec in 'a20 0.20 1.00' 'a20 0.20 0.00' 'a20 0.20 0.80' 'a40 0.40 0.50'; do
   read -r tag alpha outward_prob <<<"${spec}"
   for dfl in on clean; do
-    for seed in 0 1; do
-      name="yolov8n_full_h0_${tag}_out$(awk -v p="${outward_prob}" 'BEGIN {printf "%g", p * 100}')_dfl_${dfl}_seed${seed}"
-      uv run python scripts/crowdhuman/train_h0_boundary_noise.py \
-        --alpha "${alpha}" --outward-prob "${outward_prob}" --dfl "${dfl}" --seed "${seed}" \
-        --device "${devices}" --name "${name}"
-    done
+    seed=0
+    name="yolov8n_full_h0_${tag}_out$(awk -v p="${outward_prob}" 'BEGIN {printf "%g", p * 100}')_dfl_${dfl}_seed${seed}"
+    uv run python scripts/crowdhuman/train_h0_boundary_noise.py \
+      --alpha "${alpha}" --outward-prob "${outward_prob}" --dfl "${dfl}" --seed "${seed}" \
+      --device "${devices}" --name "${name}"
   done
 done
