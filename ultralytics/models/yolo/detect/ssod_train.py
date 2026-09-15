@@ -138,6 +138,9 @@ class SSODTrainer(BaseTrainer):
         self.conf_threshold_low = self.args.conf_threshold_low
         self.use_loc_conf = self.args.use_loc_conf
         self.loc_conf_threshold = self.args.loc_conf_threshold
+        self.two_axis_selection = self.args.two_axis_selection
+        self.loc_conf_threshold_low = self.args.loc_conf_threshold_low
+        self.loc_conf_threshold_high = self.args.loc_conf_threshold_high
         self.use_edge_conf = self.args.use_edge_conf
         self.edge_conf_threshold = self.args.edge_conf_threshold
         self.edge_conf_mask_mode = self.args.edge_conf_mask_mode
@@ -855,6 +858,9 @@ class SSODTrainer(BaseTrainer):
             conf_threshold_low=self.conf_threshold_low,
             use_loc_conf=self.use_loc_conf,
             loc_conf_threshold=self.loc_conf_threshold,
+            two_axis_selection=self.two_axis_selection,
+            loc_conf_threshold_low=self.loc_conf_threshold_low,
+            loc_conf_threshold_high=self.loc_conf_threshold_high,
             use_edge_conf=self.use_edge_conf,
             edge_conf_threshold=self.edge_conf_threshold,
             edge_conf_mask_mode=self.edge_conf_mask_mode,

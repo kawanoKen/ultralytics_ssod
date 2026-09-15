@@ -168,6 +168,9 @@ skip_zero_pseudo_cls_loss: False # (bool) if a batch has zero adopted pseudo-lab
 
 use_loc_conf: True # (bool) additionally require DFL localization confidence for reliable pseudo-labels
 loc_conf_threshold: 0.6 # (float) DFL box-level localization confidence threshold for reliable boxes
+two_axis_selection: False # (bool) Option A: reliable=(cls>=tau_high & loc>=pi_high), background=(cls<=tau_low & loc<=pi_low), otherwise ignore
+loc_conf_threshold_low: 0.6 # (float) pi_low, used only when two_axis_selection=True
+loc_conf_threshold_high: 0.8 # (float) pi_high, used only when two_axis_selection=True
 
 use_edge_conf: False # (bool) per-edge DFL confidence masking: skip only the low-confidence edges of a
                      #        reliable box's DFL loss, instead of dropping the whole box (use_loc_conf)

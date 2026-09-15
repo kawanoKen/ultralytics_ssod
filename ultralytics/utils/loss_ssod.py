@@ -40,6 +40,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
         conf_threshold_low=0.1,
         use_loc_conf=True,
         loc_conf_threshold=0.6,
+        two_axis_selection=False,
+        loc_conf_threshold_low=0.6,
+        loc_conf_threshold_high=0.8,
         use_edge_conf=False,
         edge_conf_threshold=0.6,
         edge_conf_mask_mode="selected",
@@ -57,8 +60,20 @@ class EfficientTeacherLoss(v8DetectionLoss):
         super().__init__(model)
         self.conf_threshold_high = conf_threshold_high
         self.conf_threshold_low = conf_threshold_low
+        if not 0.0 <= self.conf_threshold_low <= self.conf_threshold_high <= 1.0:
+            raise ValueError(
+                "classification thresholds must satisfy 0 <= conf_threshold_low <= conf_threshold_high <= 1"
+            )
         self.use_loc_conf = use_loc_conf
         self.loc_conf_threshold = loc_conf_threshold
+        self.two_axis_selection = two_axis_selection
+        self.loc_conf_threshold_low = loc_conf_threshold_low
+        self.loc_conf_threshold_high = loc_conf_threshold_high
+        if not 0.0 <= self.loc_conf_threshold_low <= self.loc_conf_threshold_high <= 1.0:
+            raise ValueError(
+                "two-axis localization thresholds must satisfy "
+                "0 <= loc_conf_threshold_low <= loc_conf_threshold_high <= 1"
+            )
         self.use_edge_conf = use_edge_conf
         self.edge_conf_threshold = edge_conf_threshold
         if edge_conf_mask_mode not in {"selected", "random"}:
@@ -135,6 +150,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
             unlabeled_loc_conf: [num_unlabeled_boxes, 1], optional DFL box-level localization
                 confidence (see ultralytics.utils.dfl_confidence.localization_confidence). Only
                 used to further restrict the reliable set when `self.use_loc_conf` is True.
+                With ``two_axis_selection=True``, it implements Option A: reliable =
+                cls >= tau_high AND loc >= pi_high; background = cls <= tau_low AND
+                loc <= pi_low; every other pseudo object is ignored.
             unlabeled_edge_conf: [num_unlabeled_boxes, 4], optional per-edge (l,t,r,b) DFL
                 confidence. When `self.use_edge_conf` is True, the DFL loss for a reliable box's
                 individual edge is skipped if that edge's confidence is below
@@ -540,7 +558,23 @@ class EfficientTeacherLoss(v8DetectionLoss):
         Returns:
             torch.BoolTensor: [num_unlabeled_boxes] しきい値以上のボックスだけ True のマスク
         """
-        conf_flat = unlabeled_conf.squeeze(-1) # [num_unlabeled_boxes]
+        conf_flat = unlabeled_conf.squeeze(-1)  # [num_unlabeled_boxes]
+        if self.two_axis_selection:
+            if unlabeled_loc_conf is None:
+                raise ValueError("two_axis_selection requires unlabeled_loc_conf")
+            loc_flat = unlabeled_loc_conf.squeeze(-1)
+            reliable_mask = (conf_flat >= self.conf_threshold_high) & (loc_flat >= self.loc_conf_threshold_high)
+            background_mask = (
+                (conf_flat <= self.conf_threshold_low)
+                & (loc_flat <= self.loc_conf_threshold_low)
+                & ~reliable_mask
+            )
+            # The existing `unreliable` assignment path is an anchor-level ignore path.
+            # Feed it Option A's uncertain set; background objects stay unassigned and
+            # therefore receive normal negative classification supervision.
+            unreliable_mask = ~(reliable_mask | background_mask)
+            return reliable_mask, unreliable_mask
+
         reliable_mask = (conf_flat >= self.conf_threshold_high)
         if self.use_loc_conf and unlabeled_loc_conf is not None:
             reliable_mask = reliable_mask & (unlabeled_loc_conf.squeeze(-1) >= self.loc_conf_threshold)

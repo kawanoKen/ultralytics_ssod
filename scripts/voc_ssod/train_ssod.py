@@ -1,6 +1,6 @@
 """Launch one SSOD run comparing pseudo-label filtering strategies.
 
-Three configurations are compared:
+Four configurations are available:
   --variant baseline : filter reliable boxes by classification confidence only
   --variant dfl       : ALSO require whole-box DFL localization confidence (use_loc_conf) --
                         drops the entire box if any edge is uncertain
@@ -9,6 +9,9 @@ Three configurations are compared:
                         below edge_conf_threshold are excluded -- the other, more confident
                         edges of that same box still get trained (see EfficientTeacherLoss's
                         use_edge_conf / _bbox_loss_with_edge_mask)
+  --variant two_axis  : Option A paper-style selection: high cls AND high localization is
+                        reliable; low cls AND low localization is background; all other
+                        pseudo objects are ignored.
 
 Everything else (conf thresholds, ssod_weight, epochs, batch) is held fixed across variants so
 only the filtering strategy differs.
@@ -36,7 +39,7 @@ SSOD_WEIGHT = 0.5
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", required=True, choices=["baseline", "dfl", "edge"])
+    parser.add_argument("--variant", required=True, choices=["baseline", "dfl", "edge", "two_axis"])
     parser.add_argument("--arch", required=True, help="short tag for output naming, e.g. yolov8n")
     parser.add_argument("--model", required=True, help="starting checkpoint, e.g. an already-converged best.pt")
     parser.add_argument("--data", default="VOC_ssod.yaml")
@@ -45,6 +48,10 @@ def main() -> None:
     parser.add_argument("--batch_ssod", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--tau-low", type=float, default=CONF_THRESHOLD_LOW, help="classification tau_low")
+    parser.add_argument("--tau-high", type=float, default=CONF_THRESHOLD_HIGH, help="classification tau_high")
+    parser.add_argument("--pi-low", type=float, default=0.6, help="localization pi_low for --variant two_axis")
+    parser.add_argument("--pi-high", type=float, default=0.8, help="localization pi_high for --variant two_axis")
     parser.add_argument(
         "--edge-conf-mask-mode",
         default="selected",
@@ -106,6 +113,7 @@ def main() -> None:
     args = parser.parse_args()
 
     use_loc_conf = args.variant == "dfl"
+    two_axis_selection = args.variant == "two_axis"
     use_edge_conf = args.variant == "edge"
     name = args.name or f"{args.arch}_voc_ssod_{args.variant}"
 
@@ -116,10 +124,13 @@ def main() -> None:
         epochs=EPOCHS,
         burn_in_epochs=BURN_IN_EPOCHS,
         domain_adaptation=False,
-        conf_threshold_high=CONF_THRESHOLD_HIGH,
-        conf_threshold_low=CONF_THRESHOLD_LOW,
+        conf_threshold_high=args.tau_high,
+        conf_threshold_low=args.tau_low,
         use_loc_conf=use_loc_conf,
         loc_conf_threshold=LOC_CONF_THRESHOLD,
+        two_axis_selection=two_axis_selection,
+        loc_conf_threshold_low=args.pi_low,
+        loc_conf_threshold_high=args.pi_high,
         use_edge_conf=use_edge_conf,
         edge_conf_threshold=EDGE_CONF_THRESHOLD,
         edge_conf_mask_mode=args.edge_conf_mask_mode,

@@ -55,7 +55,8 @@ def generate_ddp_file(trainer):
         "ssod", "ssod_weight", "batch_ssod", "mosaic_ssod", "mixup_ssod", "cutmix_ssod",
         "burn_in_epochs", "conf_threshold_high", "conf_threshold_low", "domain_adaptation",
         "pseudo_label_plots", "da/loss_s", "da/loss_t", "da/loss", "da_loss_weights",
-        "use_loc_conf", "loc_conf_threshold", "use_edge_conf", "edge_conf_threshold", "edge_conf_mask_mode",
+        "use_loc_conf", "loc_conf_threshold", "two_axis_selection", "loc_conf_threshold_low",
+        "loc_conf_threshold_high", "use_edge_conf", "edge_conf_threshold", "edge_conf_mask_mode",
         "edge_dfl_reweight", "edge_dfl_selector", "edge_dfl_weight", "edge_dfl_normalize",
         "oracle_edge_error_threshold",
         "assignment_stability_method", "assignment_perturbation"
