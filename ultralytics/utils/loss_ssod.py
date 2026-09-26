@@ -66,6 +66,8 @@ class EfficientTeacherLoss(v8DetectionLoss):
             )
         self.use_loc_conf = use_loc_conf
         self.loc_conf_threshold = loc_conf_threshold
+        # Per-class reliable thresholds (nc,), set by the trainer when LabelMatch-ACT is enabled.
+        self.class_conf_thresholds = None
         self.two_axis_selection = two_axis_selection
         self.loc_conf_threshold_low = loc_conf_threshold_low
         self.loc_conf_threshold_high = loc_conf_threshold_high
@@ -182,7 +184,9 @@ class EfficientTeacherLoss(v8DetectionLoss):
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
         # Targets
-        reliable_mask, unreliable_mask = self._get_reliable_and_unreliable_mask(unlabeled_conf, unlabeled_loc_conf)
+        reliable_mask, unreliable_mask = self._get_reliable_and_unreliable_mask(
+            unlabeled_conf, unlabeled_loc_conf, unlabeled_cls
+        )
 
         reliable_targets = torch.cat((unlabeled_batch_idx[reliable_mask], unlabeled_cls[reliable_mask], unlabeled_bboxes[reliable_mask]), 1)
         reliable_targets = self.preprocess(reliable_targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
@@ -546,7 +550,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
             loss_dfl = torch.zeros((), device=pred_dist.device)
         return loss_iou, loss_dfl
     
-    def _get_reliable_and_unreliable_mask(self, unlabeled_conf, unlabeled_loc_conf=None):
+    def _get_reliable_and_unreliable_mask(self, unlabeled_conf, unlabeled_loc_conf=None, unlabeled_cls=None):
         """
         Args:
             unlabeled_conf: [num_unlabeled_boxes, 1] classification confidence.
@@ -559,6 +563,17 @@ class EfficientTeacherLoss(v8DetectionLoss):
             torch.BoolTensor: [num_unlabeled_boxes] しきい値以上のボックスだけ True のマスク
         """
         conf_flat = unlabeled_conf.squeeze(-1)  # [num_unlabeled_boxes]
+        if self.class_conf_thresholds is not None:
+            if self.two_axis_selection:
+                raise ValueError("class_conf_thresholds (LabelMatch-ACT) cannot be combined with two_axis_selection")
+            if unlabeled_cls is None:
+                raise ValueError("class_conf_thresholds requires unlabeled_cls")
+            tau = self.class_conf_thresholds.to(conf_flat.device, conf_flat.dtype)[unlabeled_cls.squeeze(-1).long()]
+            reliable_mask = conf_flat >= tau
+            if self.use_loc_conf and unlabeled_loc_conf is not None:
+                reliable_mask = reliable_mask & (unlabeled_loc_conf.squeeze(-1) >= self.loc_conf_threshold)
+            # ACT has no ignore band: below tau_c a box is simply not a pseudo-label.
+            return reliable_mask, torch.zeros_like(reliable_mask)
         if self.two_axis_selection:
             if unlabeled_loc_conf is None:
                 raise ValueError("two_axis_selection requires unlabeled_loc_conf")

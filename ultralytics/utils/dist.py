@@ -57,6 +57,8 @@ def generate_ddp_file(trainer):
         "pseudo_label_plots", "da/loss_s", "da/loss_t", "da/loss", "da_loss_weights",
         "use_loc_conf", "loc_conf_threshold", "two_axis_selection", "loc_conf_threshold_low",
         "loc_conf_threshold_high", "use_edge_conf", "edge_conf_threshold", "edge_conf_mask_mode",
+        "labelmatch_act", "labelmatch_mode", "labelmatch_update_interval", "labelmatch_probe_images",
+        "labelmatch_candidate_conf_floor",
         "edge_dfl_reweight", "edge_dfl_selector", "edge_dfl_weight", "edge_dfl_normalize",
         "oracle_edge_error_threshold",
         "assignment_stability_method", "assignment_perturbation"

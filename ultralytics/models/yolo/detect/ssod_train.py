@@ -36,9 +36,11 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.loss_ssod import EfficientTeacherLoss, DomainAdversarialNet
 from ultralytics.utils.dfl_confidence import localization_confidence
+from ultralytics.utils.labelmatch_act import ACT_NMS_MAX_TIME_IMG, ACTManager, labeled_boxes_per_image
 from ultralytics.utils.ssod_diagnostics import (
     BNMismatchProbe,
     SSODDiagnosticsLogger,
+    _CsvWriter,
     compute_supervised_assignment_stats,
     dfl_entropy,
 )
@@ -171,6 +173,13 @@ class SSODTrainer(BaseTrainer):
         self.ema_loss_sup = None
         self.ema_loss_unsup = None
         self.supervised_only_control = self.args.supervised_only_control
+        self.labelmatch_act = self.args.labelmatch_act
+        if self.labelmatch_act and self.two_axis_selection:
+            raise ValueError("labelmatch_act cannot be combined with two_axis_selection")
+        # Teacher NMS conf gate for training pseudo-labels. ACT must be able to pick thresholds
+        # below the legacy 0.01 gate, so it uses its own (lower) candidate floor.
+        self.teacher_nms_conf = self.args.labelmatch_candidate_conf_floor if self.labelmatch_act else 0.01
+        self.act = None
 
 
 
@@ -548,6 +557,47 @@ class SSODTrainer(BaseTrainer):
             "Restart from a pre-burn-in checkpoint or a checkpoint written by the fixed trainer."
         )
 
+    def _build_act_probe_loader(self):
+        """Fixed, augmentation-free unlabeled subset for ACT, sharded across DDP ranks."""
+        gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        with torch_distributed_zero_first(LOCAL_RANK):
+            dataset = build_yolo_dataset(
+                self.args, self.data["ssod_train"], self.batch_size_ssod, self.data, mode="val", rect=False, stride=gs
+            )
+        n_probe = min(int(self.args.labelmatch_probe_images), len(dataset))
+        indices = np.sort(np.random.default_rng(self.args.seed).choice(len(dataset), n_probe, replace=False))
+        shard = indices[max(RANK, 0) :: max(self.world_size, 1)].tolist()
+        return torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, shard),
+            batch_size=max(self.batch_size_ssod // max(self.world_size, 1), 1),
+            shuffle=False,
+            # Worker processes gave no speedup (probe is GPU/NMS-bound) and caused a
+            # ConnectionResetError in the training loaders' pin-memory threads at DDP teardown.
+            num_workers=0,
+            collate_fn=dataset.collate_fn,
+        )
+
+    def _log_pseudo_threshold_epoch(self, epoch, iteration):
+        """Per-epoch reliable threshold and adopted pseudo-label counts (rank-0 shard, training views)."""
+        n_images = max(self._epoch_unlabeled_images, 1)
+        for c, count in enumerate(self._epoch_pseudo_counts):
+            threshold = float(self.act.thresholds[c]) if self.act is not None else float(self.conf_threshold_high)
+            self.pseudo_threshold_epoch_csv.write(
+                {
+                    "epoch": epoch + 1,
+                    "iteration": iteration,
+                    "class": c,
+                    "threshold": threshold,
+                    "threshold_source": "labelmatch_act" if self.act is not None else "fixed",
+                    "train_pseudo_boxes": int(count),
+                    "train_unlabeled_images": self._epoch_unlabeled_images,
+                    # Training views are mosaic/augmented: not comparable to rho_L (use labelmatch_act.csv for that).
+                    "train_pseudo_boxes_per_augmented_image": int(count) / n_images,
+                }
+            )
+        self._epoch_pseudo_counts[:] = 0
+        self._epoch_unlabeled_images = 0
+
     def _close_dataloader_mosaic(self):
         """Disable mix augmentations for both labeled and unlabeled training datasets."""
         for loader_name in ("train_loader", "ssod_train_loader"):
@@ -876,6 +926,21 @@ class SSODTrainer(BaseTrainer):
         )
         if RANK in {-1, 0}:
             self.ssod_diag = SSODDiagnosticsLogger(self.save_dir, ema_interval=self.args.diag_interval, dist_interval=self.args.diag_interval)
+            self.pseudo_threshold_epoch_csv = _CsvWriter(self.save_dir / "logs" / "pseudo_threshold_epoch.csv")
+        nc_ssod = self.loss_func_ssod.nc
+        self._epoch_pseudo_counts = np.zeros(nc_ssod, dtype=np.int64)
+        self._epoch_unlabeled_images = 0
+        if self.labelmatch_act:
+            rho = labeled_boxes_per_image(self.train_loader.dataset.labels, nc_ssod)
+            self.act = ACTManager(
+                rho,
+                mode=self.args.labelmatch_mode,
+                update_interval=int(self.args.labelmatch_update_interval),
+                candidate_conf_floor=float(self.args.labelmatch_candidate_conf_floor),
+                log_dir=self.save_dir / "logs" if RANK in {-1, 0} else None,
+            )
+            self.act_probe_loader = self._build_act_probe_loader()
+            LOGGER.info(f"LabelMatch-ACT enabled: labeled boxes/image per class = {np.round(rho, 3).tolist()}")
         if self.start_epoch > self.burn_in_epochs:
             self._restore_teacher_after_resume()
             if RANK != -1 and self.world_size > 1 and isinstance(self.model, nn.parallel.DistributedDataParallel):
@@ -1270,6 +1335,20 @@ class SSODTrainer(BaseTrainer):
                             if "momentum" in x:
                                 x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
+                    if self.act is not None and self.act.should_update(ni):
+                        self.act.run_offline_probe(
+                            self.teacher.ema, self.act_probe_loader, self.device, ni, epoch, amp=self.amp
+                        )
+                        self.loss_func_ssod.class_conf_thresholds = self.act.thresholds.clone()
+                        if RANK in {-1, 0}:
+                            self.act.log_last_update()
+                            LOGGER.info(
+                                f"LabelMatch-ACT update at iteration {ni}: thresholds="
+                                f"{[round(float(t), 4) for t in self.act.thresholds]}, "
+                                f"rho_U(probe)={[round(s['rho_U_probe_selected_per_image'], 3) for s in self.act.last_stats]} "
+                                f"vs rho_L={[round(s['rho_L_labeled_boxes_per_image'], 3) for s in self.act.last_stats]}"
+                            )
+
                     # Forward
                     with autocast(self.amp):
                         labeled_batch = self.preprocess_batch(labeled_batch)
@@ -1302,14 +1381,18 @@ class SSODTrainer(BaseTrainer):
                         )
 
                         unlabeled_labels, keep_idxs = non_max_suppression(
-                            unlabeled_preds_teacher, conf_thres=0.01, iou_thres=0.65, return_idxs=True
+                            unlabeled_preds_teacher,
+                            conf_thres=self.teacher_nms_conf,
+                            iou_thres=0.65,
+                            return_idxs=True,
+                            **({"max_time_img": ACT_NMS_MAX_TIME_IMG} if self.labelmatch_act else {}),
                         )
                         # Diagnostics only (see ultralytics.utils.ssod_diagnostics section 3): how many
                         # raw teacher candidates cleared NMS's own conf_thres=0.01 gate before NMS's IoU
                         # suppression ever ran, so num_removed_by_nms below is isolated from
                         # num_removed_by_confidence (our separate, much higher SSOD adoption threshold).
                         num_candidates_prenms = int(
-                            (unlabeled_preds_teacher[:, 4 : 4 + self.loss_func_ssod.nc, :].amax(1) >= 0.01).sum()
+                            (unlabeled_preds_teacher[:, 4 : 4 + self.loss_func_ssod.nc, :].amax(1) >= self.teacher_nms_conf).sum()
                         )
                         n_post_nms = sum(len(labels) for labels in unlabeled_labels)
                         batch_idx_list = []
@@ -1482,6 +1565,12 @@ class SSODTrainer(BaseTrainer):
                         # pass -- it cannot be recomputed later from a checkpoint or from running
                         # inference, unlike validation metrics or PR curves.
                         if RANK in {-1, 0}:
+                            self._epoch_unlabeled_images += unlabeled_batch["img"].shape[0]
+                            if reliable_mask.any():
+                                self._epoch_pseudo_counts += np.bincount(
+                                    unlabeled_cls[reliable_mask].long().view(-1).cpu().numpy(),
+                                    minlength=len(self._epoch_pseudo_counts),
+                                )[: len(self._epoch_pseudo_counts)]
                             unsup_stats = self.loss_func_ssod.last_assignment_stats
                             sup_stats = compute_supervised_assignment_stats(
                                 unwrap_model(self.model).criterion, preds, labeled_batch
@@ -1677,6 +1766,7 @@ class SSODTrainer(BaseTrainer):
                 if RANK in {-1, 0}:
                     self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
                     self.teacher.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+                    self._log_pseudo_threshold_epoch(epoch, ni)
 
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
@@ -1755,6 +1845,10 @@ class SSODTrainer(BaseTrainer):
                 self.plot_metrics()
             if getattr(self, "ssod_diag", None) is not None:
                 self.ssod_diag.close()
+            if getattr(self, "pseudo_threshold_epoch_csv", None) is not None:
+                self.pseudo_threshold_epoch_csv.close()
+            if self.act is not None:
+                self.act.close()
             self.run_callbacks("on_train_end")
         self._clear_memory()
         unset_deterministic()
