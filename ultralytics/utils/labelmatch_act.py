@@ -58,6 +58,7 @@ class ACTManager:
         update_interval: int = 1000,
         candidate_conf_floor: float = 0.001,
         nms_iou: float = 0.65,
+        max_det: int = 300,
         log_dir: str | Path | None = None,
     ):
         if mode not in ACT_MODES:
@@ -72,6 +73,7 @@ class ACTManager:
         self.update_interval = update_interval
         self.candidate_conf_floor = candidate_conf_floor
         self.nms_iou = nms_iou
+        self.max_det = max_det
         self.thresholds = torch.ones(self.nc)
         self.last_update_iter = None
         self.last_stats: list[dict] = []
@@ -95,10 +97,11 @@ class ACTManager:
                     "epoch": epoch,
                     "class": c,
                     "threshold": tau,
-                    "labeled_boxes_per_image": float(self.rho[c]),
+                    "rho_L_labeled_boxes_per_image": float(self.rho[c]),
                     "probe_images": num_images,
-                    "target_pseudo_count": target,
-                    "num_candidates": int(per_class_candidates[c]),
+                    "target_count_probe": target,
+                    "num_candidates_postnms": int(per_class_candidates[c]),
+                    "target_reachable": int(per_class_candidates[c]) >= target,
                     "probe_seconds": seconds,
                     "_selected": selected,
                 }
@@ -115,28 +118,39 @@ class ACTManager:
         start = time.perf_counter()
         ddp = dist.is_available() and dist.is_initialized()
         local_scores = [[] for _ in range(self.nc)]
-        local_images = 0
+        local_images = local_prenms = 0
+        saturated_min_scores = []  # lowest kept score of images whose NMS output hit max_det
         for batch in loader:
             img = batch["img"].to(device, non_blocking=True).float() / 255
             with autocast(bool(amp), device.type):
                 out = teacher(img)
-            preds = out[0] if isinstance(out, (tuple, list)) else out
+            preds = (out[0] if isinstance(out, (tuple, list)) else out).float()
+            local_prenms += int((preds[:, 4 : 4 + self.nc].amax(1) > self.candidate_conf_floor).sum())
             dets = non_max_suppression(
-                preds.float(),
+                preds,
                 conf_thres=self.candidate_conf_floor,
                 iou_thres=self.nms_iou,
+                max_det=self.max_det,
                 max_time_img=ACT_NMS_MAX_TIME_IMG,
             )
             local_images += img.shape[0]
             for det in dets:
+                if det.shape[0] >= self.max_det:
+                    saturated_min_scores.append(float(det[:, 4].min()))
                 if det.numel():
                     for c in range(self.nc):
                         local_scores[c].append(det[det[:, 5] == c, 4].float().cpu())
         local_scores = [torch.cat(s) if s else torch.empty(0) for s in local_scores]
-        counts = torch.tensor([s.numel() for s in local_scores] + [local_images], dtype=torch.float64, device=device)
+        counts = torch.tensor(
+            [s.numel() for s in local_scores]
+            + [float(s.sum()) for s in local_scores]
+            + [local_images, local_prenms, len(saturated_min_scores)],
+            dtype=torch.float64,
+            device=device,
+        )
         if ddp:
             dist.all_reduce(counts)
-        num_images = int(counts[-1].item())
+        num_images = int(counts[-3].item())
         targets = [int(round(self.rho[c] * num_images)) for c in range(self.nc)]
         # The global top-K lies inside the union of per-rank top-Ks, so only those are gathered.
         local_top = [s.topk(min(max(targets[c], 0), s.numel())).values for c, s in enumerate(local_scores)]
@@ -146,18 +160,27 @@ class ACTManager:
             merged = [torch.from_numpy(np.concatenate([g[c] for g in gathered])) for c in range(self.nc)]
         else:
             merged = local_top
-        self.update_from_scores(merged, counts[:-1].tolist(), num_images, iteration, epoch, time.perf_counter() - start)
-        # Count every candidate at or above the new threshold (can exceed K_c only through ties).
-        actual = torch.tensor(
-            [float((local_scores[c] >= self.thresholds[c]).sum()) for c in range(self.nc)],
+        per_class_candidates = counts[: self.nc].tolist()
+        self.update_from_scores(merged, per_class_candidates, num_images, iteration, epoch, time.perf_counter() - start)
+        # Count every candidate at or above the new threshold (can exceed K_c only through ties), and
+        # images where max_det truncated boxes that would still clear it (the cap then binds on ACT).
+        min_tau = float(self.thresholds.min())
+        post = torch.tensor(
+            [float((local_scores[c] >= self.thresholds[c]).sum()) for c in range(self.nc)]
+            + [float(sum(s >= min_tau for s in saturated_min_scores))],
             dtype=torch.float64,
             device=device,
         )
         if ddp:
-            dist.all_reduce(actual)
+            dist.all_reduce(post)
         for c, row in enumerate(self.last_stats):
-            row["actual_pseudo_count"] = int(actual[c].item())
-            row["pseudo_boxes_per_image"] = row["actual_pseudo_count"] / max(num_images, 1)
+            n_cand = per_class_candidates[c]
+            row["selected_count_probe"] = int(post[c].item())
+            row["rho_U_probe_selected_per_image"] = row["selected_count_probe"] / max(num_images, 1)
+            row["conf_mean_candidates"] = float(counts[self.nc + c].item()) / n_cand if n_cand else float("nan")
+            row["num_candidates_prenms"] = int(counts[-2].item())
+            row["images_at_max_det"] = int(counts[-1].item())
+            row["images_max_det_binding"] = int(post[-1].item())
         return self.thresholds
 
     def log_last_update(self) -> None:

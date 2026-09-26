@@ -572,10 +572,8 @@ class EfficientTeacherLoss(v8DetectionLoss):
             reliable_mask = conf_flat >= tau
             if self.use_loc_conf and unlabeled_loc_conf is not None:
                 reliable_mask = reliable_mask & (unlabeled_loc_conf.squeeze(-1) >= self.loc_conf_threshold)
-            # Keep the baseline's [tau_low, tau) ignore band; it is empty once ACT drops tau below tau_low.
-            ignore_floor = torch.clamp(tau, max=self.conf_threshold_low)
-            unreliable_mask = (conf_flat >= ignore_floor) & ~reliable_mask
-            return reliable_mask, unreliable_mask
+            # ACT has no ignore band: below tau_c a box is simply not a pseudo-label.
+            return reliable_mask, torch.zeros_like(reliable_mask)
         if self.two_axis_selection:
             if unlabeled_loc_conf is None:
                 raise ValueError("two_axis_selection requires unlabeled_loc_conf")

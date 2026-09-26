@@ -591,7 +591,8 @@ class SSODTrainer(BaseTrainer):
                     "threshold_source": "labelmatch_act" if self.act is not None else "fixed",
                     "train_pseudo_boxes": int(count),
                     "train_unlabeled_images": self._epoch_unlabeled_images,
-                    "train_pseudo_boxes_per_image": int(count) / n_images,
+                    # Training views are mosaic/augmented: not comparable to rho_L (use labelmatch_act.csv for that).
+                    "train_pseudo_boxes_per_augmented_image": int(count) / n_images,
                 }
             )
         self._epoch_pseudo_counts[:] = 0
@@ -1344,7 +1345,8 @@ class SSODTrainer(BaseTrainer):
                             LOGGER.info(
                                 f"LabelMatch-ACT update at iteration {ni}: thresholds="
                                 f"{[round(float(t), 4) for t in self.act.thresholds]}, "
-                                f"pseudo/image={[round(s['pseudo_boxes_per_image'], 3) for s in self.act.last_stats]}"
+                                f"rho_U(probe)={[round(s['rho_U_probe_selected_per_image'], 3) for s in self.act.last_stats]} "
+                                f"vs rho_L={[round(s['rho_L_labeled_boxes_per_image'], 3) for s in self.act.last_stats]}"
                             )
 
                     # Forward

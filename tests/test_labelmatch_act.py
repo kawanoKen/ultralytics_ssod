@@ -49,14 +49,13 @@ class ACTThresholdTests(unittest.TestCase):
 
 
 class ACTLossMaskTests(unittest.TestCase):
-    def test_class_wise_threshold_and_ignore_band(self):
-        loss = selector(torch.tensor([0.5, 0.2]))
-        conf = torch.tensor([[0.55], [0.45], [0.25], [0.22], [0.15]])
+    def test_class_wise_threshold_without_ignore_band(self):
+        loss = selector(torch.tensor([0.5, 0.007]))
+        conf = torch.tensor([[0.55], [0.45], [0.25], [0.008], [0.006]])
         cls = torch.tensor([[0], [0], [0], [1], [1]])
         reliable, unreliable = loss._get_reliable_and_unreliable_mask(conf, None, cls)
         self.assertEqual(reliable.tolist(), [True, False, False, True, False])
-        # class 0: ignore band [0.3, 0.5); class 1: tau=0.2 < tau_low, so the band is empty.
-        self.assertEqual(unreliable.tolist(), [False, True, False, False, False])
+        self.assertEqual(unreliable.tolist(), [False] * 5)  # tau_low=0.3 plays no role under ACT
 
     def test_fixed_threshold_path_unchanged(self):
         loss = selector(None)
