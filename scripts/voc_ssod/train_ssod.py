@@ -12,8 +12,10 @@ Four configurations are available:
   --variant two_axis  : Option A paper-style selection: high cls AND high localization is
                         reliable; low cls AND low localization is background; all other
                         pseudo objects are ignored.
-  --variant labelmatch_act : LabelMatch ACT: tau_high is replaced by class-wise thresholds that make
-                        pseudo boxes/image on an unlabeled probe subset match labeled GT boxes/image.
+  --variant labelmatch_act : LabelMatch ACT: candidates are the top K_c post-NMS teacher boxes on an
+                        unlabeled probe subset (K_c matches labeled GT boxes/image); the top
+                        --act-reliable-ratio of them are reliable, the rest of the candidates are
+                        ignored, and --tau-low/--tau-high are unused.
 
 Everything else (conf thresholds, ssod_weight, epochs, batch) is held fixed across variants so
 only the filtering strategy differs.
@@ -58,6 +60,9 @@ def main() -> None:
     parser.add_argument("--act-probe-images", type=int, default=10000, help="unlabeled images per ACT update")
     parser.add_argument(
         "--act-candidate-conf-floor", type=float, default=0.001, help="teacher NMS conf floor under ACT"
+    )
+    parser.add_argument(
+        "--act-reliable-ratio", type=float, default=0.2, help="top fraction of ACT candidates used as reliable"
     )
     parser.add_argument(
         "--edge-conf-mask-mode",
@@ -154,6 +159,7 @@ def main() -> None:
         labelmatch_update_interval=args.act_update_interval,
         labelmatch_probe_images=args.act_probe_images,
         labelmatch_candidate_conf_floor=args.act_candidate_conf_floor,
+        labelmatch_reliable_ratio=args.act_reliable_ratio,
         use_edge_conf=use_edge_conf,
         edge_conf_threshold=EDGE_CONF_THRESHOLD,
         edge_conf_mask_mode=args.edge_conf_mask_mode,

@@ -581,21 +581,29 @@ class SSODTrainer(BaseTrainer):
         """Per-epoch reliable threshold and adopted pseudo-label counts (rank-0 shard, training views)."""
         n_images = max(self._epoch_unlabeled_images, 1)
         for c, count in enumerate(self._epoch_pseudo_counts):
-            threshold = float(self.act.thresholds[c]) if self.act is not None else float(self.conf_threshold_high)
+            if self.act is not None:
+                reliable_t = float(self.act.reliable_thresholds[c])
+                ignore_lower = float(self.act.candidate_thresholds[c])
+            else:
+                reliable_t, ignore_lower = float(self.conf_threshold_high), float(self.conf_threshold_low)
             self.pseudo_threshold_epoch_csv.write(
                 {
                     "epoch": epoch + 1,
                     "iteration": iteration,
                     "class": c,
-                    "threshold": threshold,
+                    "reliable_threshold": reliable_t,
+                    "ignore_lower_threshold": ignore_lower,
                     "threshold_source": "labelmatch_act" if self.act is not None else "fixed",
-                    "train_pseudo_boxes": int(count),
+                    "train_reliable_boxes": int(count),
+                    "train_uncertain_boxes": int(self._epoch_uncertain_counts[c]),
                     "train_unlabeled_images": self._epoch_unlabeled_images,
                     # Training views are mosaic/augmented: not comparable to rho_L (use labelmatch_act.csv for that).
-                    "train_pseudo_boxes_per_augmented_image": int(count) / n_images,
+                    "train_reliable_boxes_per_augmented_image": int(count) / n_images,
+                    "train_uncertain_boxes_per_augmented_image": int(self._epoch_uncertain_counts[c]) / n_images,
                 }
             )
         self._epoch_pseudo_counts[:] = 0
+        self._epoch_uncertain_counts[:] = 0
         self._epoch_unlabeled_images = 0
 
     def _close_dataloader_mosaic(self):
@@ -929,6 +937,7 @@ class SSODTrainer(BaseTrainer):
             self.pseudo_threshold_epoch_csv = _CsvWriter(self.save_dir / "logs" / "pseudo_threshold_epoch.csv")
         nc_ssod = self.loss_func_ssod.nc
         self._epoch_pseudo_counts = np.zeros(nc_ssod, dtype=np.int64)
+        self._epoch_uncertain_counts = np.zeros(nc_ssod, dtype=np.int64)
         self._epoch_unlabeled_images = 0
         if self.labelmatch_act:
             rho = labeled_boxes_per_image(self.train_loader.dataset.labels, nc_ssod)
@@ -937,6 +946,7 @@ class SSODTrainer(BaseTrainer):
                 mode=self.args.labelmatch_mode,
                 update_interval=int(self.args.labelmatch_update_interval),
                 candidate_conf_floor=float(self.args.labelmatch_candidate_conf_floor),
+                reliable_ratio=float(self.args.labelmatch_reliable_ratio),
                 log_dir=self.save_dir / "logs" if RANK in {-1, 0} else None,
             )
             self.act_probe_loader = self._build_act_probe_loader()
@@ -1339,14 +1349,17 @@ class SSODTrainer(BaseTrainer):
                         self.act.run_offline_probe(
                             self.teacher.ema, self.act_probe_loader, self.device, ni, epoch, amp=self.amp
                         )
-                        self.loss_func_ssod.class_conf_thresholds = self.act.thresholds.clone()
+                        self.loss_func_ssod.class_conf_thresholds = self.act.reliable_thresholds.clone()
+                        self.loss_func_ssod.class_candidate_thresholds = self.act.candidate_thresholds.clone()
                         if RANK in {-1, 0}:
                             self.act.log_last_update()
                             LOGGER.info(
-                                f"LabelMatch-ACT update at iteration {ni}: thresholds="
-                                f"{[round(float(t), 4) for t in self.act.thresholds]}, "
-                                f"rho_U(probe)={[round(s['rho_U_probe_selected_per_image'], 3) for s in self.act.last_stats]} "
-                                f"vs rho_L={[round(s['rho_L_labeled_boxes_per_image'], 3) for s in self.act.last_stats]}"
+                                f"LabelMatch-ACT update at iteration {ni}: "
+                                f"t_c={[round(float(t), 4) for t in self.act.candidate_thresholds]}, "
+                                f"t_c^r={[round(float(t), 4) for t in self.act.reliable_thresholds]}, "
+                                f"candidates/img={[round(s['candidate_boxes_per_image'], 3) for s in self.act.last_stats]} "
+                                f"vs rho_L={[round(s['rho_L_labeled_boxes_per_image'], 3) for s in self.act.last_stats]}, "
+                                f"reliable fraction={[round(s['reliable_fraction_of_candidates'], 3) for s in self.act.last_stats]}"
                             )
 
                     # Forward
@@ -1566,11 +1579,14 @@ class SSODTrainer(BaseTrainer):
                         # inference, unlike validation metrics or PR curves.
                         if RANK in {-1, 0}:
                             self._epoch_unlabeled_images += unlabeled_batch["img"].shape[0]
-                            if reliable_mask.any():
-                                self._epoch_pseudo_counts += np.bincount(
-                                    unlabeled_cls[reliable_mask].long().view(-1).cpu().numpy(),
-                                    minlength=len(self._epoch_pseudo_counts),
-                                )[: len(self._epoch_pseudo_counts)]
+                            for counter, mask in (
+                                (self._epoch_pseudo_counts, reliable_mask),
+                                (self._epoch_uncertain_counts, unreliable_mask),
+                            ):
+                                if mask.any():
+                                    counter += np.bincount(
+                                        unlabeled_cls[mask].long().view(-1).cpu().numpy(), minlength=len(counter)
+                                    )[: len(counter)]
                             unsup_stats = self.loss_func_ssod.last_assignment_stats
                             sup_stats = compute_supervised_assignment_stats(
                                 unwrap_model(self.model).criterion, preds, labeled_batch
