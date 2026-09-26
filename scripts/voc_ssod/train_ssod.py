@@ -12,6 +12,8 @@ Four configurations are available:
   --variant two_axis  : Option A paper-style selection: high cls AND high localization is
                         reliable; low cls AND low localization is background; all other
                         pseudo objects are ignored.
+  --variant labelmatch_act : LabelMatch ACT: tau_high is replaced by class-wise thresholds that make
+                        pseudo boxes/image on an unlabeled probe subset match labeled GT boxes/image.
 
 Everything else (conf thresholds, ssod_weight, epochs, batch) is held fixed across variants so
 only the filtering strategy differs.
@@ -39,7 +41,7 @@ SSOD_WEIGHT = 0.5
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", required=True, choices=["baseline", "dfl", "edge", "two_axis"])
+    parser.add_argument("--variant", required=True, choices=["baseline", "dfl", "edge", "two_axis", "labelmatch_act"])
     parser.add_argument("--arch", required=True, help="short tag for output naming, e.g. yolov8n")
     parser.add_argument("--model", required=True, help="starting checkpoint, e.g. an already-converged best.pt")
     parser.add_argument("--data", default="VOC_ssod.yaml")
@@ -52,6 +54,11 @@ def main() -> None:
     parser.add_argument("--tau-high", type=float, default=CONF_THRESHOLD_HIGH, help="classification tau_high")
     parser.add_argument("--pi-low", type=float, default=0.6, help="localization pi_low for --variant two_axis")
     parser.add_argument("--pi-high", type=float, default=0.8, help="localization pi_high for --variant two_axis")
+    parser.add_argument("--act-update-interval", type=int, default=1000, help="ACT update interval (iterations)")
+    parser.add_argument("--act-probe-images", type=int, default=10000, help="unlabeled images per ACT update")
+    parser.add_argument(
+        "--act-candidate-conf-floor", type=float, default=0.001, help="teacher NMS conf floor under ACT"
+    )
     parser.add_argument(
         "--edge-conf-mask-mode",
         default="selected",
@@ -67,6 +74,10 @@ def main() -> None:
     parser.add_argument("--edge-dfl-weight", type=float, default=1.0)
     parser.add_argument("--no-edge-dfl-normalize", action="store_true")
     parser.add_argument("--oracle-edge-error-threshold", type=float, default=0.10)
+    parser.add_argument("--lr0", type=float, default=None, help="override the trainer default initial learning rate")
+    parser.add_argument(
+        "--warmup-epochs", type=float, default=None, help="override the trainer default warmup epoch count"
+    )
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--save_period", type=int, default=10)
     parser.add_argument("--project", default="runs/voc_ssod")
@@ -114,11 +125,19 @@ def main() -> None:
 
     use_loc_conf = args.variant == "dfl"
     two_axis_selection = args.variant == "two_axis"
+    labelmatch_act = args.variant == "labelmatch_act"
     use_edge_conf = args.variant == "edge"
     name = args.name or f"{args.arch}_voc_ssod_{args.variant}"
 
+    optional_overrides = {}
+    if args.lr0 is not None:
+        optional_overrides["lr0"] = args.lr0
+    if args.warmup_epochs is not None:
+        optional_overrides["warmup_epochs"] = args.warmup_epochs
+
     model = YOLO(args.model)
     model.train(
+        **optional_overrides,
         data=args.data,
         trainer=SSODTrainer,
         epochs=EPOCHS,
@@ -131,6 +150,10 @@ def main() -> None:
         two_axis_selection=two_axis_selection,
         loc_conf_threshold_low=args.pi_low,
         loc_conf_threshold_high=args.pi_high,
+        labelmatch_act=labelmatch_act,
+        labelmatch_update_interval=args.act_update_interval,
+        labelmatch_probe_images=args.act_probe_images,
+        labelmatch_candidate_conf_floor=args.act_candidate_conf_floor,
         use_edge_conf=use_edge_conf,
         edge_conf_threshold=EDGE_CONF_THRESHOLD,
         edge_conf_mask_mode=args.edge_conf_mask_mode,

@@ -15,6 +15,7 @@ def selector():
     loss.two_axis_selection = True
     loss.loc_conf_threshold_low = 0.6
     loss.loc_conf_threshold_high = 0.8
+    loss.class_conf_thresholds = None
     return loss
 
 

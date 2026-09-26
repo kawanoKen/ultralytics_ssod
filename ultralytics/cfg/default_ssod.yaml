@@ -171,6 +171,11 @@ loc_conf_threshold: 0.6 # (float) DFL box-level localization confidence threshol
 two_axis_selection: False # (bool) Option A: reliable=(cls>=tau_high & loc>=pi_high), background=(cls<=tau_low & loc<=pi_low), otherwise ignore
 loc_conf_threshold_low: 0.6 # (float) pi_low, used only when two_axis_selection=True
 loc_conf_threshold_high: 0.8 # (float) pi_high, used only when two_axis_selection=True
+labelmatch_act: False # (bool) LabelMatch ACT: replace conf_threshold_high by class-wise adaptive thresholds
+labelmatch_mode: offline_probe # (str) ACT score source; only offline_probe is implemented
+labelmatch_update_interval: 1000 # (int) SSOD iterations between ACT threshold updates
+labelmatch_probe_images: 10000 # (int) unlabeled images inferred per ACT update (capped at dataset size)
+labelmatch_candidate_conf_floor: 0.001 # (float) teacher NMS conf floor for ACT candidates and training pseudo-labels
 
 use_edge_conf: False # (bool) per-edge DFL confidence masking: skip only the low-confidence edges of a
                      #        reliable box's DFL loss, instead of dropping the whole box (use_loc_conf)
