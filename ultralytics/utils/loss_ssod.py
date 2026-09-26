@@ -66,8 +66,10 @@ class EfficientTeacherLoss(v8DetectionLoss):
             )
         self.use_loc_conf = use_loc_conf
         self.loc_conf_threshold = loc_conf_threshold
-        # Per-class reliable thresholds (nc,), set by the trainer when LabelMatch-ACT is enabled.
+        # Per-class reliable (t_c^r) and candidate (t_c) thresholds (nc,), set by the trainer under
+        # LabelMatch-ACT; they replace conf_threshold_high / conf_threshold_low.
         self.class_conf_thresholds = None
+        self.class_candidate_thresholds = None
         self.two_axis_selection = two_axis_selection
         self.loc_conf_threshold_low = loc_conf_threshold_low
         self.loc_conf_threshold_high = loc_conf_threshold_high
@@ -572,8 +574,11 @@ class EfficientTeacherLoss(v8DetectionLoss):
             reliable_mask = conf_flat >= tau
             if self.use_loc_conf and unlabeled_loc_conf is not None:
                 reliable_mask = reliable_mask & (unlabeled_loc_conf.squeeze(-1) >= self.loc_conf_threshold)
-            # ACT has no ignore band: below tau_c a box is simply not a pseudo-label.
-            return reliable_mask, torch.zeros_like(reliable_mask)
+            # LabelMatch-style dynamic ignore band [t_c, t_c^r); below t_c the box is discarded.
+            if self.class_candidate_thresholds is None:
+                return reliable_mask, torch.zeros_like(reliable_mask)
+            t_c = self.class_candidate_thresholds.to(conf_flat.device, conf_flat.dtype)[unlabeled_cls.squeeze(-1).long()]
+            return reliable_mask, (conf_flat >= t_c) & ~reliable_mask
         if self.two_axis_selection:
             if unlabeled_loc_conf is None:
                 raise ValueError("two_axis_selection requires unlabeled_loc_conf")

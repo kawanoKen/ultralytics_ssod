@@ -59,6 +59,7 @@ class ACTManager:
         candidate_conf_floor: float = 0.001,
         nms_iou: float = 0.65,
         max_det: int = 300,
+        reliable_ratio: float = 0.2,
         log_dir: str | Path | None = None,
     ):
         if mode not in ACT_MODES:
@@ -67,6 +68,8 @@ class ACTManager:
             raise ValueError("labelmatch_update_interval must be >= 1")
         if not 0.0 <= candidate_conf_floor < 1.0:
             raise ValueError("labelmatch_candidate_conf_floor must be in [0, 1)")
+        if not 0.0 < reliable_ratio <= 1.0:
+            raise ValueError("labelmatch_reliable_ratio must be in (0, 1]")
         self.rho = np.asarray(rho, dtype=np.float64)
         self.nc = len(self.rho)
         self.mode = mode
@@ -74,7 +77,10 @@ class ACTManager:
         self.candidate_conf_floor = candidate_conf_floor
         self.nms_iou = nms_iou
         self.max_det = max_det
-        self.thresholds = torch.ones(self.nc)
+        self.reliable_ratio = reliable_ratio
+        # t_c: K_c-th score (candidate); t_c^r: round(alpha*K_c)-th score (reliable). [t_c, t_c^r) is ignored.
+        self.candidate_thresholds = torch.ones(self.nc)
+        self.reliable_thresholds = torch.ones(self.nc)
         self.last_update_iter = None
         self.last_stats: list[dict] = []
         self._csv = _CsvWriter(Path(log_dir) / "labelmatch_act.csv") if log_dir is not None else None
@@ -87,28 +93,34 @@ class ACTManager:
         stats = []
         for c in range(self.nc):
             target = int(round(self.rho[c] * num_images))
+            target_reliable = int(round(self.reliable_ratio * target))
             scores = per_class_scores[c]
-            tau = act_threshold(scores, target, self.candidate_conf_floor)
-            selected = scores[scores >= tau] if scores.numel() else scores
-            self.thresholds[c] = tau
+            t_c = act_threshold(scores, target, self.candidate_conf_floor)
+            t_r = max(act_threshold(scores, target_reliable, self.candidate_conf_floor), t_c)
+            self.candidate_thresholds[c] = t_c
+            self.reliable_thresholds[c] = t_r
             stats.append(
                 {
                     "iteration": iteration,
                     "epoch": epoch,
                     "class": c,
-                    "threshold": tau,
+                    "candidate_threshold": t_c,
+                    "reliable_threshold": t_r,
+                    "reliable_ratio": self.reliable_ratio,
                     "rho_L_labeled_boxes_per_image": float(self.rho[c]),
                     "probe_images": num_images,
-                    "target_count_probe": target,
+                    "target_candidate_count": target,
+                    "target_reliable_count": target_reliable,
                     "num_candidates_postnms": int(per_class_candidates[c]),
                     "target_reachable": int(per_class_candidates[c]) >= target,
                     "probe_seconds": seconds,
-                    "_selected": selected,
+                    "_candidates": scores[scores >= t_c] if scores.numel() else scores,
+                    "_reliable": scores[scores >= t_r] if scores.numel() else scores,
                 }
             )
         self.last_update_iter = iteration
         self.last_stats = stats
-        return self.thresholds
+        return self.candidate_thresholds, self.reliable_thresholds
 
     @torch.no_grad()
     def run_offline_probe(self, teacher, loader, device, iteration, epoch, amp=False):
@@ -162,35 +174,44 @@ class ACTManager:
             merged = local_top
         per_class_candidates = counts[: self.nc].tolist()
         self.update_from_scores(merged, per_class_candidates, num_images, iteration, epoch, time.perf_counter() - start)
-        # Count every candidate at or above the new threshold (can exceed K_c only through ties), and
-        # images where max_det truncated boxes that would still clear it (the cap then binds on ACT).
-        min_tau = float(self.thresholds.min())
+        # Count every box at or above each threshold (can exceed the target only through ties), and
+        # images where max_det truncated boxes that would still clear t_c (the cap then binds on ACT).
+        min_t_c = float(self.candidate_thresholds.min())
         post = torch.tensor(
-            [float((local_scores[c] >= self.thresholds[c]).sum()) for c in range(self.nc)]
-            + [float(sum(s >= min_tau for s in saturated_min_scores))],
+            [float((local_scores[c] >= self.candidate_thresholds[c]).sum()) for c in range(self.nc)]
+            + [float((local_scores[c] >= self.reliable_thresholds[c]).sum()) for c in range(self.nc)]
+            + [float(sum(s >= min_t_c for s in saturated_min_scores))],
             dtype=torch.float64,
             device=device,
         )
         if ddp:
             dist.all_reduce(post)
+        m = max(num_images, 1)
         for c, row in enumerate(self.last_stats):
-            n_cand = per_class_candidates[c]
-            row["selected_count_probe"] = int(post[c].item())
-            row["rho_U_probe_selected_per_image"] = row["selected_count_probe"] / max(num_images, 1)
-            row["conf_mean_candidates"] = float(counts[self.nc + c].item()) / n_cand if n_cand else float("nan")
+            n_post = per_class_candidates[c]
+            n_cand, n_rel = int(post[c].item()), int(post[self.nc + c].item())
+            row["candidate_count_probe"] = n_cand
+            row["reliable_count_probe"] = n_rel
+            row["uncertain_count_probe"] = n_cand - n_rel
+            row["candidate_boxes_per_image"] = n_cand / m
+            row["reliable_boxes_per_image"] = n_rel / m
+            row["uncertain_boxes_per_image"] = (n_cand - n_rel) / m
+            row["reliable_fraction_of_candidates"] = n_rel / n_cand if n_cand else float("nan")
+            row["conf_mean_all_postnms"] = float(counts[self.nc + c].item()) / n_post if n_post else float("nan")
             row["num_candidates_prenms"] = int(counts[-2].item())
             row["images_at_max_det"] = int(counts[-1].item())
             row["images_max_det_binding"] = int(post[-1].item())
-        return self.thresholds
+        return self.candidate_thresholds, self.reliable_thresholds
 
     def log_last_update(self) -> None:
         if self._csv is None:
             return
         for row in self.last_stats:
-            selected = row["_selected"]
             out = {k: v for k, v in row.items() if not k.startswith("_")}
-            out["conf_mean_selected"] = float(selected.mean()) if selected.numel() else float("nan")
-            out["conf_median_selected"] = float(selected.median()) if selected.numel() else float("nan")
+            for name in ("candidates", "reliable"):
+                scores = row[f"_{name}"]
+                out[f"conf_mean_{name}"] = float(scores.mean()) if scores.numel() else float("nan")
+                out[f"conf_median_{name}"] = float(scores.median()) if scores.numel() else float("nan")
             self._csv.write(out)
 
     def close(self) -> None:
