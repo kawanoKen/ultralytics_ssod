@@ -28,7 +28,7 @@ w \in \{0,1,5,20\}
 
 > selectorだけを交換し、DFL weighting処理・normalization・loss経路は完全に共通化すること。
 
----
+
 
 # 1. 実験モード
 
@@ -46,6 +46,7 @@ edge_dfl_normalize: true
 oracle_edge_error_threshold: 0.10
 
 edge_conf_threshold: 0.60
+```
 
 名前は既存コード設計に合わせて変更してよい。
 

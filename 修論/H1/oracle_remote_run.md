@@ -72,3 +72,7 @@ runs/crowdhuman_ssod_1p_zero_pseudo_ablation/
 ```
 
 終了後は各runの`results.csv`、`weights/best.pt`、`weights/last.pt`、`logs/assignment_dynamics.csv`を保持する。
+
+## 結果
+
+集計結果と解釈は [oracle_results.md](oracle_results.md) を参照する。run単位・epoch単位の数値は同ディレクトリの `oracle_run_summary.csv` と `oracle_epoch_summary.csv` に保存する。

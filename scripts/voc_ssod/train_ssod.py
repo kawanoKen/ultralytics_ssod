@@ -52,6 +52,8 @@ def main() -> None:
     parser.add_argument("--tau-high", type=float, default=CONF_THRESHOLD_HIGH, help="classification tau_high")
     parser.add_argument("--pi-low", type=float, default=0.6, help="localization pi_low for --variant two_axis")
     parser.add_argument("--pi-high", type=float, default=0.8, help="localization pi_high for --variant two_axis")
+    parser.add_argument("--lr0", type=float, default=0.01, help="initial learning rate for the SSOD fine-tuning run")
+    parser.add_argument("--warmup-epochs", type=float, default=3.0, help="learning-rate warmup duration")
     parser.add_argument(
         "--edge-conf-mask-mode",
         default="selected",
@@ -123,6 +125,8 @@ def main() -> None:
         trainer=SSODTrainer,
         epochs=EPOCHS,
         burn_in_epochs=BURN_IN_EPOCHS,
+        lr0=args.lr0,
+        warmup_epochs=args.warmup_epochs,
         domain_adaptation=False,
         conf_threshold_high=args.tau_high,
         conf_threshold_low=args.tau_low,
