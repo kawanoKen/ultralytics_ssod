@@ -1,0 +1,12 @@
+# CrowdHuman 5p labeled split resolved via this machine's Ultralytics settings datasets_dir
+# (relative path), unlike crowdhuman_5p.yaml which hard-codes another machine's absolute path.
+# On amp1 this is /work/kawano/LA/datasets/crowdhuman -- the split the labeled-only baseline
+# checkpoints under runs/crowdhuman_labeled_baseline*/ were trained on.
+path: crowdhuman
+train: train_labeled_5p.txt
+ssod_train: train_unlabeled_5p.txt
+val: val.txt
+test: val.txt
+
+names:
+  0: person

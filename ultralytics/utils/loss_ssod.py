@@ -143,6 +143,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
         oracle_gt_cls=None,
         oracle_gt_batch_idx=None,
         compute_extra_diag=False,
+        compute_per_image=False,
     ):
         """
         Args:
@@ -349,6 +350,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
         zero_pseudo_batch = fg_mask_reliable.sum() == 0
         self.last_assignment_stats["cls_loss_skipped"] = bool(self.skip_zero_pseudo_cls_loss and zero_pseudo_batch)
         skip_this_batch = self.skip_zero_pseudo_cls_loss and zero_pseudo_batch
+        cls_denom_used = None  # divisor actually applied to the cls numerator (None = skipped)
         if skip_this_batch and not compute_extra_diag:
             # This batch adopted zero pseudo-labels as positives, so target_scores_reliable is
             # all-zero and target_scores_sum_reliable sits at its max(...,1) floor -- computing
@@ -376,6 +378,7 @@ class EfficientTeacherLoss(v8DetectionLoss):
                 # Content-independent reference denominator: batch_size * anchors_per_image.
                 # Box/DFL loss below still use target_scores_sum_reliable unchanged.
                 cls_denom = pred_scores.shape[0] * pred_scores.shape[1]
+                cls_denom_used = float(cls_denom)
                 loss[1] = cls_loss_numerator / cls_denom
             elif self.cls_loss_denom == "ema":
                 # Detectron2-style smoothed denominator: an EMA of this step's target-score mass,
@@ -388,8 +391,10 @@ class EfficientTeacherLoss(v8DetectionLoss):
                     if self.ema_target_score_sum is None
                     else self.ema_denom_beta * self.ema_target_score_sum + (1 - self.ema_denom_beta) * current_s_t
                 )
-                loss[1] = cls_loss_numerator / max(self.ema_target_score_sum, 1.0)
+                cls_denom_used = max(self.ema_target_score_sum, 1.0)
+                loss[1] = cls_loss_numerator / cls_denom_used
             else:
+                cls_denom_used = float(target_scores_sum_reliable)
                 loss[1] = cls_loss_numerator / target_scores_sum_reliable
         # Bbox loss
         if fg_mask_reliable.sum():
@@ -524,11 +529,54 @@ class EfficientTeacherLoss(v8DetectionLoss):
                     fg_mask_reliable,
                 )
 
+        self.last_per_image = None
+        self.last_cls_denom_used = cls_denom_used
+        if compute_per_image:
+            self.last_per_image = self._per_image_breakdown(
+                pred_scores, pred_distri, pred_bboxes, anchor_points, stride_tensor, target_bboxes_reliable,
+                target_scores_reliable, target_scores_sum_reliable, fg_mask_reliable, ignore_mask, cls_denom_used,
+            )
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
         return loss * batch_size, loss.detach(), reliable_mask, unreliable_mask  # loss(box, cls, dfl)
+
+    @torch.no_grad()
+    def _per_image_breakdown(
+        self, pred_scores, pred_distri, pred_bboxes, anchor_points, stride_tensor, target_bboxes, target_scores,
+        target_scores_sum, fg_mask, ignore_mask, cls_denom_used,
+    ):
+        """Per-image unsupervised loss contributions (with gains, before x batch_size); their sum over
+        images equals the returned loss.detach(). Box/DFL are only decomposed on the plain BboxLoss path."""
+        from ultralytics.utils.ssod_diagnostics import _per_image_sum, per_anchor_bbox_terms
+
+        cls_per_anchor = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).float().sum(-1)
+        mask = fg_mask if self.positive_only_cls_loss else ~ignore_mask
+        cls_numerator = (cls_per_anchor * mask).sum(1)
+        cls = cls_numerator / cls_denom_used * self.hyp.cls if cls_denom_used else torch.zeros_like(cls_numerator)
+        plain_bbox_path = not (self.edge_dfl_reweight or self.assignment_stability_method != "off" or self.use_edge_conf)
+        box = dfl = None
+        if plain_bbox_path:
+            box = torch.zeros_like(cls_numerator)
+            dfl = torch.zeros_like(cls_numerator)
+            if fg_mask.any():
+                box_t, dfl_t = per_anchor_bbox_terms(
+                    self.bbox_loss, pred_distri, pred_bboxes, anchor_points, target_bboxes / stride_tensor, target_scores, fg_mask
+                )
+                box = _per_image_sum(box_t, fg_mask) / float(target_scores_sum) * self.hyp.box
+                dfl = _per_image_sum(dfl_t, fg_mask) / float(target_scores_sum) * self.hyp.dfl
+        out = {
+            "pos_anchors": fg_mask.sum(1),
+            "ignored_anchors": ignore_mask.sum(1),
+            "target_score_sum": target_scores.sum(-1).sum(1),
+            "cls_numerator": cls_numerator,
+            "cls": cls,
+        }
+        if box is not None:
+            out.update(box=box, dfl=dfl)
+        return out
 
     def _bbox_loss_with_stability(
         self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, fg_mask, stability

@@ -39,6 +39,8 @@ from ultralytics.utils.dfl_confidence import localization_confidence
 from ultralytics.utils.labelmatch_act import ACT_NMS_MAX_TIME_IMG, ACTManager, labeled_boxes_per_image
 from ultralytics.utils.ssod_diagnostics import (
     BNMismatchProbe,
+    EpochSampleLogger,
+    compute_supervised_per_image_loss,
     SSODDiagnosticsLogger,
     _CsvWriter,
     compute_supervised_assignment_stats,
@@ -89,6 +91,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.tal import make_anchors
 
 
@@ -577,6 +580,55 @@ class SSODTrainer(BaseTrainer):
             collate_fn=dataset.collate_fn,
         )
 
+    @torch.no_grad()
+    def _log_epoch_samples(
+        self, ni, epoch, labeled_batch, unlabeled_batch, preds, unlabeled_labels, unlabeled_batch_idx,
+        reliable_mask, unreliable_mask, balance_factor, loss_items_sup, loss_items_unsup,
+    ):
+        """Per-image loss + full pseudo-label record for this rank's shard (see EpochSampleLogger)."""
+        lf = self.loss_func_ssod
+        status = torch.zeros(len(reliable_mask), dtype=torch.long, device=reliable_mask.device)
+        status[unreliable_mask] = 1
+        status[reliable_mask] = 2
+        pseudo = torch.cat((unlabeled_labels[:, :6].float(), unlabeled_batch_idx.float()), 1)
+        h, w = unlabeled_batch["img"].shape[2:]
+        gt = xywh2xyxy(unlabeled_batch["bboxes"].float()) * torch.tensor([w, h, w, h], device=pseudo.device)
+        unlabeled_bs = unlabeled_batch["img"].shape[0]
+        self.sample_logger.log_unlabeled(
+            ni, epoch, unlabeled_batch["im_file"], unlabeled_batch["img"], unlabeled_batch.get("img_strong"),
+            pseudo, status, gt, unlabeled_batch["batch_idx"], lf.last_per_image,
+            loss_scale=self.ssod_weight * balance_factor * unlabeled_bs,
+        )
+        sup = compute_supervised_per_image_loss(unwrap_model(self.model).criterion, preds, labeled_batch)
+        self.sample_logger.log_labeled(
+            ni, epoch, labeled_batch["im_file"], sup, loss_scale=float(labeled_batch["img"].shape[0])
+        )
+
+        def _t(x):
+            return None if x is None else [round(float(v), 5) for v in x]
+
+        self.sample_logger.log_step(
+            {
+                "epoch": epoch,
+                "step": ni,
+                "lr": [round(float(g["lr"]), 8) for g in self.optimizer.param_groups],
+                "threshold_source": "labelmatch_act" if self.act is not None else "fixed",
+                "reliable_thresholds": _t(lf.class_conf_thresholds) or [lf.conf_threshold_high],
+                "candidate_thresholds": _t(lf.class_candidate_thresholds) or [lf.conf_threshold_low],
+                "teacher_ema_updates": int(self.teacher.updates),
+                "cls_denom_used": lf.last_cls_denom_used,
+                "cls_loss_skipped": bool(lf.last_assignment_stats.get("cls_loss_skipped", False)),
+                "ssod_weight": self.ssod_weight,
+                "balance_factor": float(balance_factor),
+                "L_sup": [float(v) for v in loss_items_sup],
+                "L_unsup": [float(v) for v in loss_items_unsup],
+                "total_loss": float(self.loss.item()),
+                "n_reliable": int(reliable_mask.sum()),
+                "n_ignored": int(unreliable_mask.sum()),
+                "n_postnms": len(reliable_mask),
+            }
+        )
+
     def _log_pseudo_threshold_epoch(self, epoch, iteration):
         """Per-epoch reliable threshold and adopted pseudo-label counts (rank-0 shard, training views)."""
         n_images = max(self._epoch_unlabeled_images, 1)
@@ -935,6 +987,12 @@ class SSODTrainer(BaseTrainer):
         if RANK in {-1, 0}:
             self.ssod_diag = SSODDiagnosticsLogger(self.save_dir, ema_interval=self.args.diag_interval, dist_interval=self.args.diag_interval)
             self.pseudo_threshold_epoch_csv = _CsvWriter(self.save_dir / "logs" / "pseudo_threshold_epoch.csv")
+        # Per-sample records for the first N epochs, written by EVERY rank (each sees its own shard).
+        self.sample_logger = None
+        if int(self.args.sample_log_epochs) > 0:
+            self.sample_logger = EpochSampleLogger(
+                self.save_dir, RANK, epochs=int(self.args.sample_log_epochs), visualize=bool(self.args.sample_log_visualize)
+            )
         nc_ssod = self.loss_func_ssod.nc
         self._epoch_pseudo_counts = np.zeros(nc_ssod, dtype=np.int64)
         self._epoch_uncertain_counts = np.zeros(nc_ssod, dtype=np.int64)
@@ -1502,6 +1560,7 @@ class SSODTrainer(BaseTrainer):
                         # parameters themselves, not to which module reference issued the forward.
                         preds_unlabeled = unwrap_model(self.model)(student_unlabeled_img)
                         _diag_now = RANK in {-1, 0} and self.ssod_diag.should_log_dist(ni)
+                        _sample_log = self.sample_logger is not None and self.sample_logger.active(epoch)
                         loss_unlabeled, self.loss_items_unlabeled, reliable_mask, unreliable_mask = self.loss_func_ssod(
                             preds_unlabeled,
                             unlabeled_bboxes,
@@ -1515,6 +1574,7 @@ class SSODTrainer(BaseTrainer):
                             unlabeled_batch["cls"],
                             unlabeled_batch["batch_idx"].unsqueeze(-1),
                             compute_extra_diag=_diag_now,
+                            compute_per_image=_sample_log,
                         )
                         if self.assignment_stability_method != "off" and RANK in {-1, 0}:
                             stability_record = {
@@ -1564,6 +1624,12 @@ class SSODTrainer(BaseTrainer):
                             self.loss_func_ssod.last_assignment_stats["edge_dfl_loss_balance_factor"] = effective_balance_factor
                             self.loss_func_ssod.last_assignment_stats["edge_dfl_final_contribution"] = float(
                                 self.ssod_weight * effective_balance_factor * loss_unlabeled[2].detach()
+                            )
+                        if _sample_log:
+                            self._log_epoch_samples(
+                                ni, epoch, labeled_batch, unlabeled_batch, preds, unlabeled_labels,
+                                unlabeled_batch_idx, reliable_mask, unreliable_mask, effective_balance_factor,
+                                loss_items_det, loss_items_unlabeled_det,
                             )
                         if RANK != -1:
                             self.loss *= self.world_size
@@ -1856,6 +1922,8 @@ class SSODTrainer(BaseTrainer):
         LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
         # Do final val with best.pt
         self.final_eval()
+        if getattr(self, "sample_logger", None) is not None:
+            self.sample_logger.close()  # every rank owns one
         if RANK in {-1, 0}:
             if self.args.plots:
                 self.plot_metrics()

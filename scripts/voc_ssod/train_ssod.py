@@ -83,6 +83,15 @@ def main() -> None:
     parser.add_argument(
         "--warmup-epochs", type=float, default=None, help="override the trainer default warmup epoch count"
     )
+    # optimizer=auto (trainer default) silently IGNORES --lr0/--momentum and picks SGD lr=0.01 when
+    # total iterations > 10000, else AdamW lr=0.002; set --optimizer explicitly for --lr0 to apply.
+    parser.add_argument("--optimizer", default=None, help="e.g. AdamW; required for --lr0 to take effect")
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument(
+        "--warmup-bias-lr", type=float, default=None, help="auto sets 0.0; the trainer default 0.1 is large for AdamW"
+    )
+    parser.add_argument("--sample-log-epochs", type=int, default=0, help="per-sample records for the first N epochs")
+    parser.add_argument("--no-sample-log-vis", action="store_true", help="per-sample jsonl only, no JPEGs")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--save_period", type=int, default=10)
     parser.add_argument("--project", default="runs/voc_ssod")
@@ -139,6 +148,13 @@ def main() -> None:
         optional_overrides["lr0"] = args.lr0
     if args.warmup_epochs is not None:
         optional_overrides["warmup_epochs"] = args.warmup_epochs
+    for key in ("optimizer", "momentum", "warmup_bias_lr"):
+        if getattr(args, key) is not None:
+            optional_overrides[key] = getattr(args, key)
+    if args.lr0 is not None and (args.optimizer or "auto") == "auto":
+        print("WARNING: --lr0 is ignored under optimizer=auto; pass --optimizer to apply it.")
+    optional_overrides["sample_log_epochs"] = args.sample_log_epochs
+    optional_overrides["sample_log_visualize"] = not args.no_sample_log_vis
 
     model = YOLO(args.model)
     model.train(

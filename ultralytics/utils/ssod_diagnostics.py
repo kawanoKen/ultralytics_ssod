@@ -11,13 +11,212 @@ on saved predictions -- that data belongs in the validator / plotting scripts in
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ultralytics.utils.tal import make_anchors
+from ultralytics.utils.metrics import bbox_iou, box_iou
+from ultralytics.utils.tal import bbox2dist, make_anchors
+
+
+@torch.no_grad()
+def per_anchor_bbox_terms(bbox_loss, pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, fg_mask):
+    """Unnormalized per-foreground-anchor box/DFL terms, exactly as BboxLoss.forward sums them."""
+    weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+    iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+    box_term = ((1.0 - iou) * weight).view(-1)
+    if bbox_loss.dfl_loss:
+        reg_max = bbox_loss.dfl_loss.reg_max
+        target_ltrb = bbox2dist(anchor_points, target_bboxes, reg_max - 1)
+        dfl_term = (bbox_loss.dfl_loss(pred_distri[fg_mask].view(-1, reg_max), target_ltrb[fg_mask]) * weight).view(-1)
+    else:
+        dfl_term = torch.zeros_like(box_term)
+    return box_term, dfl_term
+
+
+def _per_image_sum(values, fg_mask):
+    """Scatter per-foreground-anchor values back to their image index -> (batch,)."""
+    out = torch.zeros(fg_mask.shape[0], device=fg_mask.device, dtype=torch.float32)
+    if values.numel():
+        out.index_add_(0, fg_mask.nonzero(as_tuple=True)[0], values.float())
+    return out
+
+
+@torch.no_grad()
+def compute_supervised_per_image_loss(criterion, preds, batch) -> dict:
+    """Per-image decomposition of the supervised v8DetectionLoss (sums over images = loss_items).
+
+    No extra model forward: ``preds`` are the raw predictions of the real labeled forward.
+    """
+    feats = preds[1] if isinstance(preds, tuple) else preds
+    pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], criterion.no, -1) for xi in feats], 2).split(
+        (criterion.reg_max * 4, criterion.nc), 1
+    )
+    pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+    pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+    dtype = pred_scores.dtype
+    batch_size = pred_scores.shape[0]
+    imgsz = torch.tensor(feats[0].shape[2:], device=criterion.device, dtype=dtype) * criterion.stride[0]
+    anchor_points, stride_tensor = make_anchors(feats, criterion.stride, 0.5)
+    targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1).to(criterion.device)
+    targets = criterion.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+    gt_labels, gt_bboxes = targets.split((1, 4), 2)
+    mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+    pred_bboxes = criterion.bbox_decode(anchor_points, pred_distri)
+    _, target_bboxes, target_scores, fg_mask, _ = criterion.assigner(
+        pred_scores.detach().sigmoid(),
+        (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+        anchor_points * stride_tensor,
+        gt_labels,
+        gt_bboxes,
+        mask_gt,
+    )
+    fg_mask = fg_mask.bool()
+    tss = max(float(target_scores.sum()), 1.0)
+    cls = criterion.bce(pred_scores, target_scores.to(dtype)).float().sum(-1).sum(1) / tss * criterion.hyp.cls
+    box = torch.zeros(batch_size, device=fg_mask.device)
+    dfl = torch.zeros(batch_size, device=fg_mask.device)
+    if fg_mask.any():
+        box_t, dfl_t = per_anchor_bbox_terms(
+            criterion.bbox_loss, pred_distri, pred_bboxes, anchor_points, target_bboxes / stride_tensor, target_scores, fg_mask
+        )
+        box = _per_image_sum(box_t, fg_mask) / tss * criterion.hyp.box
+        dfl = _per_image_sum(dfl_t, fg_mask) / tss * criterion.hyp.dfl
+    return {
+        "n_gt": mask_gt.squeeze(-1).sum(1),
+        "pos_anchors": fg_mask.sum(1),
+        "target_score_sum": target_scores.sum(-1).sum(1),
+        "cls": cls,
+        "box": box,
+        "dfl": dfl,
+    }
+
+
+_STATUS_NAMES = {2: "reliable", 1: "ignored", 0: "discarded"}
+
+
+def _to_bgr(img: torch.Tensor) -> np.ndarray:
+    return (img.detach().float().clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()[:, :, ::-1].copy()
+
+
+class EpochSampleLogger:
+    """Per-sample records (every unlabeled and labeled image) for the first ``epochs`` SSOD epochs.
+
+    Written by every DDP rank to its own files, so the union covers all samples:
+      epoch_samples/unlabeled_rank{r}.jsonl : per unlabeled image -- all teacher pseudo boxes
+          [x1,y1,x2,y2,conf,cls,status,max_IoU_to_GT] (status 2=reliable,1=ignored,0=discarded),
+          transformed GT, per-image unsupervised loss contribution
+      epoch_samples/labeled_rank{r}.jsonl   : per labeled image -- per-image supervised loss
+      epoch_samples/steps_rank{r}.jsonl     : per step -- thresholds, denominators, weights, totals
+      epoch_samples/vis/rank{r}/*.jpg       : weak (teacher) | strong (student) views with GT (blue),
+          reliable (green), ignored (yellow); discarded boxes are only in the jsonl
+    GT of unlabeled images is used for this offline record only, never for training.
+    """
+
+    def __init__(self, save_dir, rank: int, epochs: int = 1, visualize: bool = True):
+        self.epochs = epochs
+        self.rank = max(rank, 0)
+        self.visualize = visualize
+        self.dir = Path(save_dir) / "epoch_samples"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.vis_dir = self.dir / "vis" / f"rank{self.rank}"
+        if visualize:
+            self.vis_dir.mkdir(parents=True, exist_ok=True)
+        self._files = {k: open(self.dir / f"{k}_rank{self.rank}.jsonl", "a", encoding="utf-8") for k in ("unlabeled", "labeled", "steps")}
+
+    def active(self, epoch: int) -> bool:
+        return epoch < self.epochs
+
+    def _write(self, key, row):
+        self._files[key].write(json.dumps(row) + "\n")
+
+    def log_step(self, row: dict) -> None:
+        self._write("steps", {"rank": self.rank, **row})
+        for f in self._files.values():
+            f.flush()
+
+    def log_labeled(self, step, epoch, im_files, per_image: dict, loss_scale: float) -> None:
+        n = len(im_files)
+        vals = {k: v.detach().float().cpu().tolist() for k, v in per_image.items()}
+        for b in range(n):
+            loss_sum = vals["cls"][b] + vals["box"][b] + vals["dfl"][b]
+            self._write(
+                "labeled",
+                {
+                    "epoch": epoch, "step": step, "rank": self.rank, "batch_pos": b, "im_file": im_files[b],
+                    **{k: vals[k][b] for k in vals},
+                    "loss_sum": loss_sum, "effective_contribution": loss_sum * loss_scale,
+                },
+            )
+
+    def log_unlabeled(self, step, epoch, im_files, img_weak, img_strong, pseudo, status, gt_xyxy, gt_bidx, per_image, loss_scale):
+        """``pseudo``: (N,7) pixel x1,y1,x2,y2,conf,cls,batch_idx; ``status``: (N,) int; GT pixel xyxy + batch idx."""
+        vals = {k: v.detach().float().cpu().tolist() for k, v in per_image.items()} if per_image else {}
+        pseudo, status, gt_xyxy, gt_bidx = pseudo.float().cpu(), status.cpu(), gt_xyxy.float().cpu(), gt_bidx.cpu()
+        for b in range(len(im_files)):
+            pm = pseudo[:, 6] == b
+            p, s, g = pseudo[pm], status[pm], gt_xyxy[gt_bidx == b]
+            max_iou = box_iou(p[:, :4], g).max(1).values if len(p) and len(g) else torch.zeros(len(p))
+            counts = {name: int((s == code).sum()) for code, name in _STATUS_NAMES.items()}
+            tp = {name: int(((s == code) & (max_iou >= 0.5)).sum()) for code, name in _STATUS_NAMES.items()}
+            loss = {k: vals[k][b] for k in vals}
+            loss_sum = sum(loss.get(k, 0.0) or 0.0 for k in ("cls", "box", "dfl"))
+            row = {
+                "epoch": epoch, "step": step, "rank": self.rank, "batch_pos": b, "im_file": im_files[b],
+                "n_gt": len(g), "n_postnms": len(p),
+                **{f"n_{k}": v for k, v in counts.items()},
+                **{f"tp50_{k}": v for k, v in tp.items()},
+                "conf_max": float(p[:, 4].max()) if len(p) else None,
+                "loss": {**loss, "loss_sum": loss_sum, "effective_contribution": loss_sum * loss_scale},
+                # [x1, y1, x2, y2, conf, cls, status, max_IoU_to_GT]
+                "boxes": [
+                    [round(float(v), 2) for v in p[j, :4]]
+                    + [round(float(p[j, 4]), 4), int(p[j, 5]), int(s[j]), round(float(max_iou[j]), 3)]
+                    for j in range(len(p))
+                ],
+                "gt": [[round(float(v), 1) for v in r] for r in g],
+            }
+            self._write("unlabeled", row)
+            if self.visualize:
+                self._draw(step, epoch, b, im_files[b], img_weak[b], img_strong[b] if img_strong is not None else None, p, s, g, row)
+
+    def _draw(self, step, epoch, b, im_file, weak, strong, p, s, g, row):
+        import cv2
+
+        panels = []
+        for img in (weak, strong) if strong is not None else (weak,):
+            canvas = _to_bgr(img)
+            for x1, y1, x2, y2 in g.tolist():
+                cv2.rectangle(canvas, (int(x1), int(y1)), (int(x2), int(y2)), (255, 128, 0), 1)
+            for j in range(len(p)):
+                if int(s[j]) == 0:
+                    continue
+                color, thick = ((0, 220, 0), 2) if int(s[j]) == 2 else ((0, 220, 255), 1)
+                x1, y1, x2, y2 = (int(v) for v in p[j, :4].tolist())
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thick)
+                if int(s[j]) == 2:
+                    cv2.putText(canvas, f"{float(p[j, 4]):.2f}", (x1, max(y1 - 2, 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+            panels.append(canvas)
+        img = np.concatenate(panels, 1)
+        loss = row["loss"]
+        header = np.zeros((36, img.shape[1], 3), dtype=np.uint8)
+        lines = [
+            f"ep{epoch} step{step} r{self.rank} {Path(im_file).stem}  GT {row['n_gt']}  reliable {row['n_reliable']} "
+            f"(TP50 {row['tp50_reliable']})  ignored {row['n_ignored']} (TP50 {row['tp50_ignored']})  discarded {row['n_discarded']}",
+            "  ".join(f"{k} {v:.4g}" for k, v in loss.items() if isinstance(v, (int, float)) and v is not None),
+        ]
+        for k, line in enumerate(lines):
+            cv2.putText(header, line, (4, 14 + 16 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+        cv2.imwrite(str(self.vis_dir / f"e{epoch}_s{step:06d}_b{b:03d}_{Path(im_file).stem}.jpg"), np.concatenate((header, img), 0),
+                    [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    def close(self) -> None:
+        for f in self._files.values():
+            f.close()
 
 
 class _CsvWriter:
